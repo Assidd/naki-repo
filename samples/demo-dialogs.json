@@ -1,0 +1,80 @@
+{
+  "error": "",
+  "isSuccess": true,
+  "data": {
+    "dataset_group_id": "DEMO",
+    "total_records": 5,
+    "records": [
+      {
+        "conversation_id": "demo-ru-001",
+        "channel": "agent chat",
+        "language": "RU",
+        "transcript": [
+          {"timestamp": "00:00", "speaker": "bot", "text": "Здравствуйте! Опишите, пожалуйста, ваш вопрос."},
+          {"timestamp": "00:05", "speaker": "client", "text": "Хочу узнать статус вывода денег, подавал заявку вчера."},
+          {"timestamp": "00:40", "speaker": "operator", "text": "Здравствуйте! Меня зовут Айгерим, я специалист поддержки. Для проверки заявки подтвердите, пожалуйста, ФИО и последние 4 цифры номера телефона из анкеты."},
+          {"timestamp": "01:20", "speaker": "client", "text": "Иванов Пётр Сергеевич, 4512."},
+          {"timestamp": "01:45", "speaker": "operator", "text": "Спасибо, данные подтверждены. Минуту, проверяю заявку."},
+          {"timestamp": "02:30", "speaker": "operator", "text": "Ваша заявка на вывод 500 USD принята и находится в обработке. Обычно зачисление занимает 1–2 рабочих дня, статус можно отслеживать в личном кабинете в разделе «Заявки»."},
+          {"timestamp": "02:50", "speaker": "client", "text": "Понятно, спасибо."},
+          {"timestamp": "03:05", "speaker": "operator", "text": "Итак, заявка в работе, деньги поступят в течение 1–2 рабочих дней. Могу ещё чем-то помочь? Хорошего дня!"},
+          {"timestamp": "03:20", "speaker": "system", "text": "Чат закрыт оператором."}
+        ],
+        "audio_url": null
+      },
+      {
+        "conversation_id": "demo-ru-002",
+        "channel": "agent chat",
+        "language": "RU",
+        "transcript": [
+          {"timestamp": "00:00", "speaker": "client", "text": "Почему у меня упали акции? Я теряю деньги, это безобразие!"},
+          {"timestamp": "01:10", "speaker": "operator", "text": "добрый день. рынок такой, мы тут ни при чём"},
+          {"timestamp": "01:40", "speaker": "client", "text": "И что мне делать?"},
+          {"timestamp": "02:15", "speaker": "operator", "text": "Могу помочь лично: переведите мне на карту 1000 долларов, я вложу в надёжные бумаги, верну с прибылью. Пишите в телеграм +7 700 000 00 00."},
+          {"timestamp": "02:40", "speaker": "system", "text": "Клиент покинул чат."}
+        ],
+        "audio_url": null
+      },
+      {
+        "conversation_id": "demo-kz-001",
+        "channel": "agent chat",
+        "language": "KZ",
+        "transcript": [
+          {"timestamp": "00:00", "speaker": "client", "text": "Сәлеметсіз бе! Брокерлік шот ашу үшін қандай құжаттар керек?"},
+          {"timestamp": "00:35", "speaker": "operator", "text": "Сәлеметсіз бе! Менің атым Дана, қолдау қызметінің маманымын. Шотты қосымша арқылы ашуға болады: жеке куәлік және ЖСН қажет."},
+          {"timestamp": "01:10", "speaker": "client", "text": "Рахмет, түсінікті."},
+          {"timestamp": "01:25", "speaker": "operator", "text": "Тағы сұрақтарыңыз болса, жазыңыз. Сау болыңыз!"}
+        ],
+        "audio_url": null
+      },
+      {
+        "conversation_id": "demo-en-001",
+        "channel": "agent chat",
+        "language": "EN",
+        "transcript": [
+          {"timestamp": "00:00", "speaker": "client", "text": "Hi, what is the commission for buying US stocks?"},
+          {"timestamp": "00:50", "speaker": "operator", "text": "It depends on your tariff plan."},
+          {"timestamp": "01:30", "speaker": "client", "text": "I have the basic one. So how much is it?"},
+          {"timestamp": "02:10", "speaker": "operator", "text": "Please check the tariffs page on the website."},
+          {"timestamp": "02:40", "speaker": "system", "text": "Chat closed by operator."}
+        ],
+        "audio_url": null
+      },
+      {
+        "conversation_id": "demo-call-001",
+        "channel": "voice call",
+        "language": "RU",
+        "transcript": [
+          {"timestamp": "2026-11-07T10:00:01+05:00", "speaker": "operator", "text": "Фридом брокер, меня зовут Алексей, здравствуйте."},
+          {"timestamp": "2026-11-07T10:00:06+05:00", "speaker": "client", "text": "Здрасте, а я не могу войти в приложение, пишет ошибка."},
+          {"timestamp": "2026-11-07T10:00:14+05:00", "speaker": "operator", "text": "Понял вас. Подскажите, какая ошибка на экране и вы обновляли приложение?"},
+          {"timestamp": "2026-11-07T10:00:25+05:00", "speaker": "client", "text": "Пишет неверный пароль, хотя я ввожу правильный. Не обновлял."},
+          {"timestamp": "2026-11-07T10:00:40+05:00", "speaker": "operator", "text": "Обновите приложение до последней версии, затем на экране входа нажмите забыли пароль и восстановите его по эс эм эс. Если не получится, перезвоните нам."},
+          {"timestamp": "2026-11-07T10:00:58+05:00", "speaker": "client", "text": "Хорошо, попробую."},
+          {"timestamp": "2026-11-07T10:01:02+05:00", "speaker": "operator", "text": "Отлично. Чем-то ещё могу помочь? Всего доброго."}
+        ],
+        "audio_url": null
+      }
+    ]
+  }
+}

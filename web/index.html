@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CQA · Контроль качества диалогов</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Весь интерфейс монтируется в #cqa-root: тот же блок можно встроить как HTML-ресурс Dynamics 365. -->
+  <div id="cqa-root" class="cqa">
+    <header class="topbar">
+      <div class="brand"><span class="logo">F</span><div><b>CQA</b><small>Контроль качества диалогов</small></div></div>
+      <nav>
+        <a href="#/" data-nav="list">Диалоги</a>
+        <a href="#/checklist" data-nav="checklist">Чек-лист</a>
+        <a href="#/appeals" data-nav="appeals">Апелляции <span id="appeal-count" class="pill" hidden></span></a>
+      </nav>
+      <div id="model-status" class="model-status"></div>
+    </header>
+    <main id="view"></main>
+    <div id="toast" class="toast" hidden></div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

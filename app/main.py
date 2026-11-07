@@ -10,8 +10,8 @@ from urllib.parse import urlsplit
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,7 @@ from . import llm  # noqa: E402
 from .dataset import DatasetError, extract_records, fetch_from_organizer, save_records  # noqa: E402
 from .db import connect, dumps, init_db, loads, now  # noqa: E402
 from .default_checklist import DEFAULT_CHECKLIST  # noqa: E402
+from .importers import CSV_TEMPLATE, parse_file  # noqa: E402
 from .evaluator import evaluate, semaphore  # noqa: E402
 from .scoring import ChecklistError, allowed_answers, compute, validate_checklist  # noqa: E402
 
@@ -171,6 +172,31 @@ def dataset_import(body: ImportIn):
         return save_records(extract_records(body.payload), body.group_id.strip() or "MANUAL")
     except DatasetError as exc:
         raise HTTPException(400, str(exc)) from None
+
+
+MAX_UPLOAD = 20 * 1024 * 1024
+
+
+@app.post("/api/dataset/upload")
+async def dataset_upload(request: Request, filename: str, group_id: str = "MANUAL", language: str = "AUTO", channel: str = "agent chat"):
+    """Тело запроса — содержимое файла. Формат определяется по расширению имени файла."""
+    data = await request.body()
+    if len(data) > MAX_UPLOAD:
+        raise HTTPException(413, "Файл больше 20 МБ")
+    if channel not in ("agent chat", "voice call"):
+        raise HTTPException(400, "Канал: agent chat или voice call")
+    try:
+        records = parse_file(filename, data, language, channel)
+        result = save_records(records, group_id.strip() or "MANUAL")
+    except DatasetError as exc:
+        raise HTTPException(400, f"{filename}: {exc}") from None
+    return {**result, "filename": filename, "ids": [r["conversation_id"] for r in records][:50]}
+
+
+@app.get("/api/dataset/template.csv")
+def dataset_template():
+    return Response(CSV_TEMPLATE.encode("utf-8-sig"), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="cqa-template.csv"'})
 
 
 @app.get("/api/conversations")

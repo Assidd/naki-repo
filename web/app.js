@@ -156,12 +156,35 @@
         <div class="row">
           <label class="field">Набор (group_id)<input id="group-id" type="text" value="DEV" size="10"></label>
           <button class="btn" id="fetch-btn" style="align-self:flex-end">↓ Загрузить из API организаторов</button>
-          <label class="btn" style="align-self:flex-end">⇪ Импорт JSON <input id="import-file" type="file" accept=".json,application/json" hidden></label>
+          <button class="btn" id="import-toggle" style="align-self:flex-end" aria-expanded="false">⇪ Импорт из файлов</button>
           <span class="grow"></span>
           <label class="field">Версия чек-листа<select id="checklist-select">${checklists.map((c) => `<option value="${c.id}">v${c.version} — ${esc(c.comment)}</option>`).join("")}</select></label>
           <button class="btn primary" id="batch-btn" style="align-self:flex-end">▶ Оценить неоценённые${f.group ? " в " + esc(f.group) : ""}</button>
         </div>
-        ${status && !status.organizer_configured ? '<p class="small muted">API организаторов не настроен: впишите ссылку GET в ORGANIZER_API_URL в файле .env. Пока можно загрузить JSON вручную.</p>' : ""}
+        ${status && !status.organizer_configured ? '<p class="small muted">API организаторов не настроен: впишите ссылку GET в ORGANIZER_API_URL в файле .env. Пока можно загрузить диалоги из файлов.</p>' : ""}
+        <div class="import-box" id="import-box" hidden>
+          <h3>Импорт из файлов</h3>
+          <p class="small muted">Форматы: <b>JSON</b> (как в API организаторов), <b>CSV / TSV</b> и <b>Excel (.xlsx)</b> — одна строка на реплику, <b>TXT</b> — строки вида «Оператор: текст». Можно выбрать несколько файлов сразу.
+            <a href="/api/dataset/template.csv">Скачать шаблон CSV</a></p>
+          <div class="row">
+            <label class="field grow">Файлы<input id="import-files" type="file" multiple accept=".json,.csv,.tsv,.xlsx,.txt"></label>
+            <label class="field">Набор<input id="import-group" type="text" value="MANUAL" size="10"></label>
+            <label class="field" data-tip="Используется, если язык не указан в файле">Язык, если не указан
+              <select id="import-lang"><option value="AUTO">Определить автоматически</option><option value="RU">Русский</option><option value="KZ">Казахский</option><option value="EN">Английский</option></select></label>
+            <label class="field" data-tip="Используется, если канал не указан в файле">Канал, если не указан
+              <select id="import-channel"><option value="agent chat">Чат</option><option value="voice call">Звонок</option></select></label>
+            <button class="btn primary" id="import-btn" style="align-self:flex-end" disabled>Импортировать</button>
+          </div>
+          <details class="small" style="margin-top:8px"><summary>Как оформить файл</summary>
+            <ul>
+              <li><b>CSV / Excel:</b> первая строка — заголовки. Обязательны <span class="mono">speaker</span> (роль) и <span class="mono">text</span>; по желанию <span class="mono">conversation_id</span>, <span class="mono">timestamp</span>, <span class="mono">channel</span>, <span class="mono">language</span>, <span class="mono">audio_url</span>. Русские названия тоже подходят: «диалог», «роль», «текст», «время», «канал», «язык».</li>
+              <li><b>Роли:</b> оператор / клиент / бот / система (или operator / client / bot / system, agent, customer).</li>
+              <li><b>TXT:</b> каждая реплика с новой строки: «[00:12] Оператор: Здравствуйте!». Несколько диалогов в одном файле разделяйте строкой «### id-диалога». Без заголовка ID диалога = имя файла.</li>
+              <li>Если в файле есть диалог с уже существующим ID, он обновится.</li>
+            </ul>
+          </details>
+          <div id="import-result" class="small" style="margin-top:8px"></div>
+        </div>
       </div>
 
       <div class="panel">
@@ -218,18 +241,63 @@
       } catch (err) { toast(err.message, true); render(); }
     });
 
-    document.getElementById("import-file").addEventListener("change", async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-      try {
-        const payload = JSON.parse(await file.text());
-        const group = prompt("Название набора (group_id) для импортированных диалогов:", "MANUAL");
-        if (group === null) return;
-        const r = await api("/dataset/import", { method: "POST", body: { group_id: group, payload } });
-        toast(`Импортировано ${r.total} диалогов в «${r.group_id}»`);
-        render();
-      } catch (err) { toast("Импорт не выполнен: " + err.message, true); }
+    const importBox = document.getElementById("import-box");
+    const importToggle = document.getElementById("import-toggle");
+    importBox.hidden = !state.importOpen;
+    importToggle.setAttribute("aria-expanded", String(!!state.importOpen));
+    importToggle.addEventListener("click", () => {
+      state.importOpen = importBox.hidden;
+      importBox.hidden = !importBox.hidden;
+      importToggle.setAttribute("aria-expanded", String(!importBox.hidden));
     });
+    if (state.importOpts) {
+      document.getElementById("import-group").value = state.importOpts.group;
+      document.getElementById("import-lang").value = state.importOpts.lang;
+      document.getElementById("import-channel").value = state.importOpts.channel;
+    }
+    const filesInput = document.getElementById("import-files");
+    const importBtn = document.getElementById("import-btn");
+    filesInput.addEventListener("change", () => {
+      importBtn.disabled = !filesInput.files.length;
+      importBtn.textContent = filesInput.files.length > 1 ? `Импортировать ${filesInput.files.length} файла(ов)` : "Импортировать";
+    });
+    importBtn.addEventListener("click", async () => {
+      const files = [...filesInput.files];
+      if (!files.length) return;
+      importBtn.disabled = true;
+      const out = document.getElementById("import-result");
+      const results = [];
+      for (const file of files) {
+        const q = new URLSearchParams({
+          filename: file.name,
+          group_id: document.getElementById("import-group").value || "MANUAL",
+          language: document.getElementById("import-lang").value,
+          channel: document.getElementById("import-channel").value,
+        });
+        try {
+          const res = await fetch("/api/dataset/upload?" + q, { method: "POST", body: file, headers: { "Content-Type": "application/octet-stream" } });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || `Ошибка ${res.status}`);
+          results.push({ ok: true, text: `${file.name}: ${data.total} диал. (новых ${data.created}, обновлено ${data.updated})` });
+        } catch (err) {
+          results.push({ ok: false, text: err.message });
+        }
+      }
+      const okCount = results.filter((r) => r.ok).length;
+      state.importOpen = true;
+      state.importOpts = {
+        group: document.getElementById("import-group").value,
+        lang: document.getElementById("import-lang").value,
+        channel: document.getElementById("import-channel").value,
+      };
+      state.lastImport = results;
+      toast(okCount === files.length ? "Импорт завершён" : `Импортировано файлов: ${okCount} из ${files.length}`, okCount !== files.length);
+      await render();
+    });
+    if (state.lastImport) {
+      document.getElementById("import-result").innerHTML = state.lastImport.map((r) => `<div class="${r.ok ? "" : "error-text"}">${r.ok ? "✓" : "✕"} ${esc(r.text)}</div>`).join("");
+      state.lastImport = null;
+    }
 
     document.getElementById("batch-btn").addEventListener("click", async (e) => {
       e.currentTarget.disabled = true;

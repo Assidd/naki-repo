@@ -1,12 +1,17 @@
 """FastAPI: API + раздача интерфейса из папки web/."""
 import asyncio
+import html
 import os
+import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -29,6 +34,15 @@ async def lifespan(_app):
 
 app = FastAPI(title="CQA — оценка качества диалогов", docs_url="/api/docs", openapi_url="/api/openapi.json", lifespan=lifespan)
 _tasks: set = set()
+
+
+@app.middleware("http")
+async def no_cache_ui(request, call_next):
+    # Файлы интерфейса не кэшируем: после обновления всегда загружается свежая версия.
+    response = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 # ---------- вспомогательные ----------
@@ -201,6 +215,42 @@ def conversation(cid: str):
         ]
         conv["latest_evaluation_id"] = ids[0] if ids else None
     return conv
+
+
+_audio_cache: dict[str, tuple[float, str]] = {}
+
+
+@app.get("/api/conversations/{cid}/audio")
+async def conversation_audio(cid: str):
+    """Звонки: audio_url ведёт на HTML-плеер организаторов, где лежит временная ссылка на mp3.
+    Сервер достаёт её и перенаправляет браузер, чтобы запись играла прямо в карточке."""
+    with connect() as conn:
+        page_url = _conversation(conn, cid)["audio_url"]
+    if not page_url:
+        raise HTTPException(404, "У диалога нет записи")
+    cached = _audio_cache.get(cid)
+    if cached and cached[0] > time.time():
+        return RedirectResponse(cached[1])
+    page_host = urlsplit(page_url).hostname or ""
+    allowed = urlsplit(os.getenv("ORGANIZER_API_URL", "")).hostname
+    if page_url.lower().split("?")[0].endswith((".mp3", ".wav", ".m4a", ".ogg")):
+        return RedirectResponse(page_url)
+    if not allowed or page_host != allowed:
+        raise HTTPException(400, "Запись не с сервера организаторов — откройте ссылку вручную")
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(page_url)
+            resp.raise_for_status()
+    except httpx.HTTPError:
+        raise HTTPException(502, "Не удалось открыть плеер организаторов") from None
+    match = re.search(r'<source[^>]+src="([^"]+)"', resp.text) or re.search(r'<audio[^>]+src="([^"]+)"', resp.text)
+    if not match:
+        raise HTTPException(502, "На странице плеера не найдена ссылка на запись")
+    src = html.unescape(match.group(1))
+    if urlsplit(src).scheme != "https":
+        raise HTTPException(502, "Ссылка на запись не HTTPS")
+    _audio_cache[cid] = (time.time() + 40 * 60, src)  # ссылка организаторов живёт около часа
+    return RedirectResponse(src)
 
 
 # ---------- чек-лист ----------

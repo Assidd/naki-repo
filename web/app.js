@@ -208,6 +208,26 @@
     if (rows.some((r) => r.evaluation && ["queued", "running"].includes(r.evaluation.status))) poll(render);
   }
 
+  // Позиция реплики в записи звонка: время от начала, без интервалов, когда запись стояла на паузе
+  // (системные сообщения «Запись … приостановлены» / «… возобновлены»). Это оценка, а не точная синхронизация.
+  function audioOffsets(transcript) {
+    const out = {};
+    let prev = null, total = 0, paused = false;
+    for (const m of transcript) {
+      const ts = Date.parse(m.timestamp);
+      if (isNaN(ts)) continue;
+      if (prev !== null && !paused) total += Math.max(0, (ts - prev) / 1000);
+      prev = ts;
+      out[m.id] = Math.round(total * 10) / 10;
+      if (m.speaker === "system") {
+        const t = m.text.toLowerCase();
+        if (/приостанов|paused|тоқтат/.test(t)) paused = true;
+        if (/возобнов|resumed|жалғас/.test(t)) paused = false;
+      }
+    }
+    return out;
+  }
+
   // ---------- карточка диалога ----------
   async function viewCard(cid, evalId) {
     const conv = await api("/conversations/" + encodeURIComponent(cid));
@@ -215,7 +235,8 @@
     const eid = evalId || conv.latest_evaluation_id;
     const ev = eid ? await api("/evaluations/" + eid) : null;
     const isCall = conv.channel === "voice call";
-    const firstTs = isCall ? Date.parse(conv.transcript[0]?.timestamp) : NaN;
+    const offsets = isCall ? audioOffsets(conv.transcript) : {};
+    const firstTs = NaN;
 
     $view.innerHTML = `
       <p><a href="#/">← Все диалоги</a></p>
@@ -226,11 +247,11 @@
           <h2>Транскрипт</h2>
           ${isCall && conv.audio_url ? `
             <div class="panel" style="padding:10px">
-              <audio id="audio" controls preload="none" src="${esc(conv.audio_url)}" style="width:100%"></audio>
+              <audio id="audio" controls preload="none" src="/api/conversations/${encodeURIComponent(conv.id)}/audio" style="width:100%"></audio>
               <div class="small muted">Если плеер не воспроизводит запись — <a href="${esc(conv.audio_url)}" target="_blank" rel="noopener">откройте её в плеере организаторов</a>. Клик по цитате перематывает запись к реплике.</div>
             </div>` : ""}
           ${conv.transcript.map((m) => `
-            <div class="msg ${esc(m.speaker)}" id="msg-${esc(m.id)}" data-ts="${esc(m.timestamp)}">
+            <div class="msg ${esc(m.speaker)}" id="msg-${esc(m.id)}" data-ts="${esc(m.timestamp)}" data-offset="${offsets[m.id] ?? ""}">
               <div class="id">${esc(m.id)}</div>
               <div><span class="who">${SPEAKER[m.speaker] || esc(m.speaker)}</span><span class="ts">${esc(m.timestamp)}</span><div class="text">${esc(m.text)}</div></div>
             </div>`).join("")}
@@ -343,9 +364,13 @@
       }
     }
     const audio = document.getElementById("audio");
-    const ts = Date.parse(el.dataset.ts);
-    if (audio && !isNaN(ts) && !isNaN(firstTs)) {
-      try { audio.currentTime = Math.max(0, (ts - firstTs) / 1000 - 1); audio.play().catch(() => {}); } catch { /* плеер недоступен */ }
+    const offset = Number(el.dataset.offset);
+    if (audio && el.dataset.offset !== "" && !isNaN(offset)) {
+      try {
+        const max = isFinite(audio.duration) ? audio.duration - 1 : Infinity;
+        audio.currentTime = Math.max(0, Math.min(offset - 1, max));
+        audio.play().catch(() => {});
+      } catch { /* плеер недоступен */ }
     }
   }
 

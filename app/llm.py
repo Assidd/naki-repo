@@ -3,9 +3,11 @@
 Каждый провайдер получает system/user промпт и JSON-схему ответа, возвращает разобранный JSON
 и расход токенов. Ключи читаются только на сервере из .env.
 """
+import asyncio
 import base64
 import json
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import httpx
@@ -42,13 +44,14 @@ KNOWN_PRICES = {
     "gpt-4.1-mini": (0.40, 1.60),
     "gpt-4.1": (2.00, 8.00),
     "o4-mini": (1.10, 4.40),
+    "gemini-3.8-flash": (0.75, 3.75),  # вводной тариф до 31.12.2026; звук — по той же цене
     "gemini-2.5-flash-lite": (0.10, 0.40),
     "gemini-2.5-flash": (0.30, 2.50),
     "gemini-2.5-pro": (1.25, 10.00),
     "gemini-2.0-flash": (0.10, 0.40),
 }
 # Входной звук у Gemini дороже текста (USD за 1 млн аудио-токенов, ~32 токена на секунду записи)
-AUDIO_PRICES = {"gemini-2.5-flash-lite": 0.30, "gemini-2.5-flash": 1.00, "gemini-2.5-pro": 1.25, "gemini-2.0-flash": 0.70}
+AUDIO_PRICES = {"gemini-3.8-flash": 0.75, "gemini-2.5-flash-lite": 0.30, "gemini-2.5-flash": 1.00, "gemini-2.5-pro": 1.25, "gemini-2.0-flash": 0.70}
 
 DEFAULT_OPENAI_MODELS = "gpt-4o-mini,gpt-4.1-mini,gpt-4.1,gpt-4o"
 
@@ -137,7 +140,7 @@ class GeminiProvider:
 
     def __init__(self, model: str | None = None):
         self.key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
     @property
     def available(self) -> bool:
@@ -155,24 +158,56 @@ class GeminiProvider:
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
         }
+        payload = None
+        # Временные ошибки Google (перегрузка 503, лимит 429, 500) повторяем с паузой
+        delays = [4, 12, 25]
+        async with _gemini_slots(bool(audio)):
+            for attempt in range(len(delays) + 1):
+                try:
+                    async with httpx.AsyncClient(timeout=300 if audio else 120) as client:
+                        resp = await client.post(url, json=body, headers={"x-goog-api-key": self.key})
+                    if resp.status_code in (429, 500, 502, 503, 504) and attempt < len(delays):
+                        await asyncio.sleep(delays[attempt])
+                        continue
+                    if resp.status_code >= 400:
+                        try:
+                            msg = resp.json().get("error", {}).get("message", "")
+                        except ValueError:
+                            msg = ""
+                        raise LLMError(f"Gemini: HTTP {resp.status_code}" + (f" — {msg[:200]}" if msg else ""))
+                    payload = resp.json()
+                    break
+                except httpx.HTTPError as exc:
+                    if attempt < len(delays):
+                        await asyncio.sleep(delays[attempt])
+                        continue
+                    raise LLMError(f"Gemini: {type(exc).__name__}") from None
         try:
-            async with httpx.AsyncClient(timeout=240 if audio else 120) as client:
-                resp = await client.post(url, json=body, headers={"x-goog-api-key": self.key})
-                resp.raise_for_status()
-                payload = resp.json()
-        except httpx.HTTPStatusError as exc:
-            raise LLMError(f"Gemini: HTTP {exc.response.status_code}") from None
-        except httpx.HTTPError as exc:
-            raise LLMError(f"Gemini: {type(exc).__name__}") from None
-        try:
-            text = payload["candidates"][0]["content"]["parts"][0]["text"]
+            parts_out = payload["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts_out if not p.get("thought"))
             data = json.loads(text)
-        except (KeyError, IndexError, ValueError):
+        except (KeyError, IndexError, ValueError, TypeError):
             raise LLMError("Gemini вернул ответ без JSON") from None
         usage = payload.get("usageMetadata", {})
         audio_tokens = sum(d.get("tokenCount", 0) for d in usage.get("promptTokensDetails", []) if d.get("modality") == "AUDIO")
         out = usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0)
         return LLMReply(data, self.model, usage.get("promptTokenCount", 0), out, audio_tokens)
+
+
+_audio_sem: asyncio.Semaphore | None = None
+
+
+@asynccontextmanager
+async def _gemini_slots(is_audio: bool):
+    """Запросы со звуком тяжёлые: не больше AUDIO_CONCURRENCY (по умолчанию 2) одновременно."""
+    global _audio_sem
+    if not is_audio:
+        yield
+        return
+    if _audio_sem is None:
+        _audio_sem = asyncio.Semaphore(int(os.getenv("AUDIO_CONCURRENCY", "2") or 2))
+    async with _audio_sem:
+        yield
 
 
 PROVIDERS = {"openai": OpenAIProvider, "gemini": GeminiProvider}
@@ -184,7 +219,7 @@ def available_models() -> list[dict]:
     out = []
     lists = {
         "openai": os.getenv("OPENAI_MODELS", "").strip() or DEFAULT_OPENAI_MODELS,
-        "gemini": os.getenv("GEMINI_MODELS", "").strip() or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        "gemini": os.getenv("GEMINI_MODELS", "").strip() or os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
     }
     for name, cls in PROVIDERS.items():
         p = cls()

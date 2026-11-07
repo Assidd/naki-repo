@@ -87,6 +87,10 @@ def connect():
 def init_db(default_checklist: dict) -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # Миграция: модель, выбранная пользователем для оценки
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(evaluations)")}
+        if "requested_model" not in cols:
+            conn.execute("ALTER TABLE evaluations ADD COLUMN requested_model TEXT")
         # Задачи, прерванные перезапуском сервера, не должны висеть вечно.
         conn.execute(
             "UPDATE evaluations SET status='failed', error='Сервер был перезапущен во время оценки', finished_at=? "

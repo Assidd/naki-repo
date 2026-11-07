@@ -3,7 +3,12 @@
   "use strict";
 
   const $view = document.getElementById("view");
-  const state = { filters: { q: "", language: "", channel: "", status: "", critical: false, group: "" }, analyticsGroup: "", pollTimer: null, refocus: null };
+  const state = { filters: { q: "", language: "", channel: "", status: "", critical: false, group: "" }, analyticsGroup: "", pollTimer: null, refocus: null, models: [] };
+  const store = {
+    get(k) { try { return localStorage.getItem("cqa:" + k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem("cqa:" + k, v); } catch { /* хранилище недоступно */ } },
+  };
+  state.model = store.get("model") || "";
 
   const LANG = { RU: "Русский", KZ: "Казахский", EN: "Английский" };
   const CHANNEL = { "agent chat": "Чат", "voice call": "Звонок" };
@@ -108,12 +113,99 @@
       document.getElementById("model-status").innerHTML = s.llm.configured
         ? "Модель оценки<br>" + s.llm.providers.map((p, i) => `<b>${esc(p.model)}</b>${i ? " (запасная)" : ""}`).join("<br>")
         : '<span class="chip bad">Модель не настроена</span><br>Укажите OPENAI_API_KEY в .env';
+      state.models = s.llm.models || [];
+      if (state.model && !state.models.some((m) => m.id === state.model)) state.model = "";
       const pill = document.getElementById("appeal-count");
       pill.hidden = !s.open_appeals;
       pill.textContent = s.open_appeals;
       return s;
     } catch { return null; }
   }
+
+  // ---------- выбор модели ----------
+  function modelSelect(id) {
+    if (!state.models.length) return "";
+    const price = (m) => (m.price ? ` · $${m.price.input_per_1m} / $${m.price.output_per_1m} за 1M` : "");
+    const def = state.models.find((m) => m.default) || state.models[0];
+    return `<label class="field" data-tip="Модель для новых оценок. Цена ориентировочная: вход / выход за 1 млн токенов">Модель
+      <select id="${id}"><option value="">По умолчанию (${esc(def.model)})</option>
+      ${state.models.map((m) => `<option value="${esc(m.id)}" ${state.model === m.id ? "selected" : ""}>${esc(m.model)}${m.provider !== "openai" ? " (" + esc(m.provider) + ")" : ""}${price(m)}</option>`).join("")}</select></label>`;
+  }
+  function bindModelSelect(id) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", () => { state.model = el.value; store.set("model", el.value); });
+  }
+
+  // ---------- сдача результатов ----------
+  function resultsPanel(groups) {
+    const g = state.resultsGroup || (groups.includes("DEV") ? "DEV" : groups[0] || "");
+    const target = state.resultsTarget || (g === "DEV" ? "dev" : "prod");
+    return `
+      <div class="panel" id="results-panel">
+        <div class="panel-head"><h2>Сдача результатов организаторам</h2><span class="small muted">формат JSON 1.0 из приложения к гайду</span></div>
+        <p class="small muted" style="margin-top:-6px">Файл записывается в репозиторий: <span class="mono">results/dev/results.json</span> — DEV, <span class="mono">results/prod/results.json</span> — контрольный набор. После сохранения сделайте commit и push.</p>
+        <div class="row">
+          <label class="field">Набор<select id="res-group">${groups.map((x) => `<option ${x === g ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>
+          <label class="field">Куда<select id="res-target"><option value="dev" ${target === "dev" ? "selected" : ""}>results/dev</option><option value="prod" ${target === "prod" ? "selected" : ""}>results/prod</option></select></label>
+          <label class="chk" style="align-self:flex-end;padding-bottom:8px" data-tip="Выключено: выгружается оценка модели. Включено: с учётом решений проверяющих по апелляциям.">
+            <input type="checkbox" id="res-appeals" ${state.resultsAppeals ? "checked" : ""}> С учётом апелляций</label>
+          <span class="grow"></span>
+          <button class="btn" id="res-check" style="align-self:flex-end">Проверить</button>
+          <button class="btn" id="res-download" style="align-self:flex-end">↓ Скачать JSON</button>
+          <button class="btn primary" id="res-save" style="align-self:flex-end">Сохранить в репозиторий</button>
+        </div>
+        <div id="res-out" class="small" style="margin-top:10px"></div>
+      </div>`;
+  }
+
+  function bindResults(groups) {
+    if (!groups.length) return;
+    const val = () => ({ group: document.getElementById("res-group").value, target: document.getElementById("res-target").value, appeals: document.getElementById("res-appeals").checked });
+    const remember = () => { const v = val(); state.resultsGroup = v.group; state.resultsTarget = v.target; state.resultsAppeals = v.appeals; };
+    document.getElementById("res-group").addEventListener("change", (e) => {
+      document.getElementById("res-target").value = e.target.value === "DEV" ? "dev" : "prod";
+      remember();
+    });
+    ["res-target", "res-appeals"].forEach((id) => document.getElementById(id).addEventListener("change", remember));
+    const out = document.getElementById("res-out");
+    const report = (r, saved) => {
+      const failed = r.problems.filter((p) => p.includes("status=error"));
+      const errors = r.problems.filter((p) => !p.includes("status=error"));
+      out.innerHTML = `
+        <div class="banner ${r.problems.length ? "warn" : "info"}" style="margin:0">${r.problems.length ? "!" : "✓"}<div>
+          ${saved ? `<b>Сохранено: ${esc(saved)}</b><br>` : ""}Записей: <b>${r.total}</b>, оценено: <b>${r.ok}</b>, с ошибкой: <b>${r.total - r.ok}</b>.
+          ${r.problems.length ? "" : " Проверка формата пройдена."}
+          ${failed.length ? `<br>Не оценены (попадут в файл со status = "error"): ${failed.length}. Запустите их оценку и выгрузите заново.` : ""}
+          ${errors.length ? `<ul>${errors.slice(0, 8).map((p) => `<li>${esc(p)}</li>`).join("")}</ul>` : ""}
+          ${saved ? `<div style="margin-top:6px">Дальше: <span class="mono">git add results &amp;&amp; git commit -m "Results" &amp;&amp; git push</span></div>` : ""}
+        </div></div>`;
+    };
+    const fetchResults = (v) => api(`/results?group_id=${encodeURIComponent(v.group)}&use_appeals=${v.appeals}`);
+    document.getElementById("res-check").addEventListener("click", async () => {
+      try { report(await fetchResults(val())); } catch (err) { toast(err.message, true); }
+    });
+    document.getElementById("res-download").addEventListener("click", async () => {
+      try {
+        const r = await fetchResults(val());
+        report(r);
+        const blob = new Blob([JSON.stringify(r.payload, null, 2) + "\n"], { type: "application/json" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "results.json";
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      } catch (err) { toast(err.message, true); }
+    });
+    document.getElementById("res-save").addEventListener("click", async () => {
+      const v = val();
+      try {
+        const r = await api("/results/save", { method: "POST", body: { group_id: v.group, target: v.target, use_appeals: v.appeals } });
+        report(r, r.path);
+        toast("Файл " + r.path + " сохранён");
+      } catch (err) { toast(err.message, true); }
+    });
+  }
+
 
   // ---------- список диалогов ----------
   async function viewList() {
@@ -159,7 +251,12 @@
           <button class="btn" id="import-toggle" style="align-self:flex-end" aria-expanded="false">⇪ Импорт из файлов</button>
           <span class="grow"></span>
           <label class="field">Версия чек-листа<select id="checklist-select">${checklists.map((c) => `<option value="${c.id}">v${c.version} — ${esc(c.comment)}</option>`).join("")}</select></label>
-          <button class="btn primary" id="batch-btn" style="align-self:flex-end">▶ Оценить неоценённые${f.group ? " в " + esc(f.group) : ""}</button>
+          ${modelSelect("model-select")}
+          <button class="btn primary" id="batch-btn" style="align-self:flex-end">▶ ${state.reevaluate ? "Оценить все" : "Оценить неоценённые"}${f.group ? " в " + esc(f.group) : ""}</button>
+        </div>
+        <div class="row small" style="margin-top:8px;justify-content:flex-end">
+          <label class="chk" data-tip="Запустить новую оценку и для уже оценённых диалогов — например, чтобы сравнить модели. Старые оценки сохраняются в истории.">
+            <input type="checkbox" id="reevaluate" ${state.reevaluate ? "checked" : ""}> Переоценить и уже оценённые</label>
         </div>
         ${status && !status.organizer_configured ? '<p class="small muted">API организаторов не настроен: впишите ссылку GET в ORGANIZER_API_URL в файле .env. Пока можно загрузить диалоги из файлов.</p>' : ""}
         <div class="import-box" id="import-box" hidden>
@@ -186,6 +283,8 @@
           <div id="import-result" class="small" style="margin-top:8px"></div>
         </div>
       </div>
+
+      ${groups.length ? resultsPanel(groups) : ""}
 
       <div class="panel">
         <div class="filters">
@@ -299,10 +398,13 @@
       state.lastImport = null;
     }
 
+    bindModelSelect("model-select");
+    document.getElementById("reevaluate").addEventListener("change", (e) => { state.reevaluate = e.target.checked; render(); });
+    bindResults(groups);
     document.getElementById("batch-btn").addEventListener("click", async (e) => {
       e.currentTarget.disabled = true;
       try {
-        const body = { checklist_id: Number(document.getElementById("checklist-select").value), only_unevaluated: true };
+        const body = { checklist_id: Number(document.getElementById("checklist-select").value), only_unevaluated: !state.reevaluate, model: state.model || null };
         if (f.group) body.group_id = f.group;
         const r = await api("/evaluations/batch", { method: "POST", body });
         toast(r.started.length ? `Запущено оценок: ${r.started.length}` : "Все диалоги уже оценены этой версией чек-листа");
@@ -354,6 +456,7 @@
           <span class="chip">Набор ${esc(conv.group_id)}</span><span class="chip">${conv.transcript.length} реплик</span></div></div>
         <div class="row">
           <label class="field">Версия чек-листа<select id="run-checklist">${checklists.map((c) => `<option value="${c.id}" ${ev && ev.checklist_id === c.id ? "selected" : ""}>v${c.version} — ${esc(c.comment)}</option>`).join("")}</select></label>
+          ${modelSelect("card-model")}
           <button class="btn primary" id="run-btn" style="align-self:flex-end" ${ev && ["queued", "running"].includes(ev.status) ? "disabled" : ""}>${ev ? "↻ Оценить заново" : "▶ Запустить оценку"}</button>
         </div>
       </div>
@@ -390,12 +493,14 @@
       bindEvaluation(ev, cid);
     }
 
+    bindModelSelect("card-model");
     document.getElementById("run-btn").addEventListener("click", async (e) => {
-      e.currentTarget.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
       try {
-        const r = await api("/evaluations", { method: "POST", body: { conversation_id: cid, checklist_id: Number(document.getElementById("run-checklist").value) } });
+        const r = await api("/evaluations", { method: "POST", body: { conversation_id: cid, checklist_id: Number(document.getElementById("run-checklist").value), model: state.model || null } });
         viewCard(cid, r.id);
-      } catch (err) { toast(err.message, true); e.currentTarget.disabled = false; }
+      } catch (err) { toast(err.message, true); btn.disabled = false; }
     });
     const hist = document.getElementById("history");
     if (hist) hist.addEventListener("change", () => viewCard(cid, Number(hist.value)));

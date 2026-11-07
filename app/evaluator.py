@@ -190,9 +190,9 @@ def check_reply(data: dict, conv: dict, checklist: dict) -> tuple[dict, list[str
     return results, structural, evidence_issues
 
 
-async def evaluate(conv: dict, checklist: dict) -> dict:
+async def evaluate(conv: dict, checklist: dict, model: str | None = None) -> dict:
     """Возвращает словарь для сохранения в evaluations. Бросает llm.LLMError, если ни один провайдер не ответил."""
-    chain = llm.provider_chain()
+    chain = llm.provider_chain(model)
     if not chain:
         raise llm.LLMError("Не настроен ни один провайдер модели. Укажите OPENAI_API_KEY в .env и перезапустите сервер.")
     user_prompt = build_user_prompt(conv, checklist)
@@ -237,7 +237,7 @@ async def evaluate(conv: dict, checklist: dict) -> dict:
             "model": f"{provider.name}:{model} (prompt {PROMPT_VERSION})",
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
-            "cost_usd": llm.cost_usd(provider.name, tokens_in, tokens_out),
+            "cost_usd": llm.cost_usd(provider.name, provider.model, tokens_in, tokens_out),
         }
     raise llm.LLMError("; ".join(errors) or "Модель не ответила")
 

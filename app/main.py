@@ -23,6 +23,7 @@ from .dataset import DatasetError, extract_records, fetch_from_organizer, save_r
 from .db import connect, dumps, init_db, loads, now  # noqa: E402
 from .default_checklist import DEFAULT_CHECKLIST  # noqa: E402
 from .importers import CSV_TEMPLATE, parse_file  # noqa: E402
+from . import results as results_mod  # noqa: E402
 from .evaluator import evaluate, semaphore  # noqa: E402
 from .scoring import ChecklistError, allowed_answers, compute, validate_checklist  # noqa: E402
 
@@ -98,12 +99,12 @@ async def _run(eid: int):
     limit = int(os.getenv("EVAL_CONCURRENCY", "3") or 3)
     async with semaphore(limit):
         with connect() as conn:
-            row = conn.execute("SELECT conversation_id, checklist_id FROM evaluations WHERE id=?", (eid,)).fetchone()
+            row = conn.execute("SELECT conversation_id, checklist_id, requested_model FROM evaluations WHERE id=?", (eid,)).fetchone()
             conv = _conversation(conn, row["conversation_id"])
             checklist = _checklist(conn, row["checklist_id"])["data"]
             conn.execute("UPDATE evaluations SET status='running' WHERE id=?", (eid,))
         try:
-            out = await evaluate(conv, checklist)
+            out = await evaluate(conv, checklist, row["requested_model"])
         except Exception as exc:  # ошибка API не превращается в нулевую оценку
             with connect() as conn:
                 conn.execute("UPDATE evaluations SET status='failed', error=?, finished_at=? WHERE id=?", (str(exc)[:1000], now(), eid))
@@ -117,7 +118,7 @@ async def _run(eid: int):
             )
 
 
-def _start(conversation_id: str, checklist_id: int) -> int:
+def _start(conversation_id: str, checklist_id: int, model: str | None = None) -> int:
     with connect() as conn:
         _conversation(conn, conversation_id)
         busy = conn.execute(
@@ -126,8 +127,8 @@ def _start(conversation_id: str, checklist_id: int) -> int:
         if busy:
             return busy["id"]
         cur = conn.execute(
-            "INSERT INTO evaluations(conversation_id, checklist_id, status, created_at) VALUES (?,?, 'queued', ?)",
-            (conversation_id, checklist_id, now()),
+            "INSERT INTO evaluations(conversation_id, checklist_id, status, created_at, requested_model) VALUES (?,?, 'queued', ?, ?)",
+            (conversation_id, checklist_id, now(), model),
         )
         eid = cur.lastrowid
     task = asyncio.get_running_loop().create_task(_run(eid))
@@ -328,6 +329,15 @@ def checklist_save(body: ChecklistIn):
 class EvaluateIn(BaseModel):
     conversation_id: str
     checklist_id: int | None = None
+    model: str | None = None  # «провайдер:модель» из /api/status → llm.models
+
+
+def _check_model(model: str | None) -> str | None:
+    if not model:
+        return None
+    if model not in {m["id"] for m in llm.available_models()}:
+        raise HTTPException(400, f"Модель «{model}» недоступна. Список моделей задаётся в .env (OPENAI_MODELS).")
+    return model
 
 
 @app.post("/api/evaluations", status_code=202)
@@ -336,7 +346,7 @@ async def evaluation_start(body: EvaluateIn):
         raise HTTPException(503, "Модель не настроена: укажите OPENAI_API_KEY в .env и перезапустите сервер.")
     with connect() as conn:
         checklist_id = _checklist(conn, body.checklist_id)["id"]
-    return {"id": _start(body.conversation_id, checklist_id)}
+    return {"id": _start(body.conversation_id, checklist_id, _check_model(body.model))}
 
 
 class BatchIn(BaseModel):
@@ -344,6 +354,7 @@ class BatchIn(BaseModel):
     group_id: str | None = None
     only_unevaluated: bool = True
     checklist_id: int | None = None
+    model: str | None = None
 
 
 @app.post("/api/evaluations/batch", status_code=202)
@@ -364,7 +375,8 @@ async def evaluation_batch(body: BatchIn):
                 for r in conn.execute("SELECT DISTINCT conversation_id FROM evaluations WHERE checklist_id=? AND status IN ('done','needs_review','queued','running')", (checklist_id,))
             }
             ids = [i for i in ids if i not in done]
-    return {"started": [_start(i, checklist_id) for i in ids], "checklist_id": checklist_id}
+    model = _check_model(body.model)
+    return {"started": [_start(i, checklist_id, model) for i in ids], "checklist_id": checklist_id}
 
 
 @app.get("/api/evaluations/{eid}")
@@ -563,6 +575,57 @@ def analytics(group_id: str | None = None):
             "tokens_in": int(tokens_in), "tokens_out": int(tokens_out), "evaluations": evaluations_total,
         },
     }
+
+
+# ---------- сдача результатов (формат организаторов JSON 1.0) ----------
+
+def _results_payload(group_id: str, use_appeals: bool) -> tuple[dict, list[str]]:
+    with connect() as conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM conversations WHERE group_id=? ORDER BY id", (group_id,))]
+        if not ids:
+            raise HTTPException(404, f"В наборе «{group_id}» нет диалогов")
+        records, models = [], []
+        for cid in ids:
+            row = conn.execute(
+                "SELECT id FROM evaluations WHERE conversation_id=? AND status IN ('done','needs_review') ORDER BY id DESC LIMIT 1", (cid,)
+            ).fetchone() or conn.execute("SELECT id FROM evaluations WHERE conversation_id=? ORDER BY id DESC LIMIT 1", (cid,)).fetchone()
+            ev = _evaluation(conn, row["id"]) if row else None
+            checklist = _checklist(conn, ev["checklist_id"])["data"] if ev else None
+            if ev and ev.get("model"):
+                models.append(ev["model"].split(" (")[0])
+            records.append(results_mod.build_record(cid, ev, checklist, use_appeals))
+    payload = {
+        "schema_version": "1.0",
+        "team_name": results_mod.team_name(),
+        "model": results_mod.model_block(models),
+        "results": records,
+    }
+    return payload, results_mod.validate(payload, ids)
+
+
+@app.get("/api/results")
+def results_get(group_id: str, use_appeals: bool = False):
+    payload, problems = _results_payload(group_id, use_appeals)
+    return {"payload": payload, "problems": problems, "total": len(payload["results"]),
+            "ok": sum(r["status"] == "ok" for r in payload["results"])}
+
+
+class ResultsSaveIn(BaseModel):
+    group_id: str
+    target: str  # dev | prod
+    use_appeals: bool = False
+
+
+@app.post("/api/results/save")
+def results_save(body: ResultsSaveIn):
+    payload, problems = _results_payload(body.group_id, body.use_appeals)
+    try:
+        root = Path(os.getenv("RESULTS_ROOT", "") or ROOT)
+        path = results_mod.write(payload, body.target, root)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    return {"path": str(path.relative_to(root)).replace("\\", "/"), "problems": problems, "total": len(payload["results"]),
+            "ok": sum(r["status"] == "ok" for r in payload["results"])}
 
 
 # ---------- экспорт ----------

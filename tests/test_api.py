@@ -53,7 +53,7 @@ def client(tmp_path, monkeypatch):
 
 def use_fake(monkeypatch, replies):
     fake = FakeProvider(replies)
-    monkeypatch.setattr(llm, "provider_chain", lambda: [fake])
+    monkeypatch.setattr(llm, "provider_chain", lambda *a, **k: [fake])
     return fake
 
 
@@ -127,7 +127,7 @@ def test_provider_error_is_not_zero_score(client, monkeypatch):
         async def complete(self, *a):
             raise llm.LLMError("timeout")
 
-    monkeypatch.setattr(llm, "provider_chain", lambda: [Broken([])])
+    monkeypatch.setattr(llm, "provider_chain", lambda *a, **k: [Broken([])])
     eid = client.post("/api/evaluations", json={"conversation_id": "demo-ru-001"}).json()["id"]
     ev = wait_eval(client, eid)
     assert ev["status"] == "failed" and ev["score"] is None
@@ -143,7 +143,7 @@ def test_fallback_provider_is_used(client, monkeypatch):
             raise llm.LLMError("quota")
 
     backup = FakeProvider([good_reply()])
-    monkeypatch.setattr(llm, "provider_chain", lambda: [Broken([]), backup])
+    monkeypatch.setattr(llm, "provider_chain", lambda *a, **k: [Broken([]), backup])
     eid = client.post("/api/evaluations", json={"conversation_id": "demo-ru-001"}).json()["id"]
     ev = wait_eval(client, eid)
     assert ev["status"] == "done" and ev["model"].startswith("fake:")
@@ -184,3 +184,52 @@ def test_analytics_uses_final_scores(client, monkeypatch):
     c2 = next(c for c in data["criteria"] if c["id"] == "c2")
     assert c2["na"] == 1 and c2["fulfilment"] is None
     assert data["groups"] == ["DEMO"]
+
+
+def test_results_export_matches_organizer_format(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("RESULTS_ROOT", str(tmp_path))
+    monkeypatch.setenv("TEAM_NAME", "naki")
+    client.post("/api/dataset/import", json={"group_id": "DEMO", "payload": SAMPLES})
+    use_fake(monkeypatch, [good_reply()])
+    eid = client.post("/api/evaluations", json={"conversation_id": "demo-ru-001"}).json()["id"]
+    wait_eval(client, eid)
+    a = client.post("/api/appeals", json={"evaluation_id": eid, "criterion_id": "c4", "comment": "x"}).json()
+    client.post(f"/api/appeals/{a['id']}/decide", json={"decision": "change", "new_answer": "15", "reason": "y"})
+
+    data = client.get("/api/results?group_id=DEMO").json()
+    p = data["payload"]
+    assert p["schema_version"] == "1.0" and p["team_name"] == "naki"
+    assert p["model"] == {"mode": "external_api", "name": "fake-model"}
+    assert len(p["results"]) == 5 and data["ok"] == 1
+    rec = next(r for r in p["results"] if r["conversation_id"] == "demo-ru-001")
+    vals = {c["criterion_id"]: c["value"] for c in rec["criteria"]}
+    assert vals == {"contact": True, "discovery": None, "identification": True, "consultation": 20,
+                    "empathy": True, "dialogue": 10, "closure": True, "critical": False}
+    assert next(c for c in rec["criteria"] if c["criterion_id"] == "contact")["evidence_turns"] == [3]
+    assert rec["score"] == {"final_score": 100.0, "critical_flag": False}  # по умолчанию — оценка модели без апелляций
+    err = next(r for r in p["results"] if r["conversation_id"] == "demo-en-001")
+    assert err == {"conversation_id": "demo-en-001", "status": "error", "criteria": [], "score": None, "error": "Оценка ещё не выполнена"}
+    assert any("status=error" in x for x in data["problems"])
+
+    with_appeals = client.get("/api/results?group_id=DEMO&use_appeals=true").json()["payload"]
+    rec2 = next(r for r in with_appeals["results"] if r["conversation_id"] == "demo-ru-001")
+    assert rec2["score"]["final_score"] == 94.12
+
+    saved = client.post("/api/results/save", json={"group_id": "DEMO", "target": "dev"}).json()
+    assert saved["path"] == "results/dev/results.json"
+    on_disk = json.loads((tmp_path / "results" / "dev" / "results.json").read_text(encoding="utf-8"))
+    assert on_disk == p
+    assert client.post("/api/results/save", json={"group_id": "DEMO", "target": "test"}).status_code == 400
+
+
+def test_model_selection(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_MODELS", "gpt-4o-mini,gpt-4.1")
+    models = {m["id"] for m in client.get("/api/status").json()["llm"]["models"]}
+    assert {"openai:gpt-4o-mini", "openai:gpt-4.1"} <= models
+    chain = llm.provider_chain("openai:gpt-4.1")
+    assert chain[0].name == "openai" and chain[0].model == "gpt-4.1"
+    client.post("/api/dataset/import", json={"group_id": "DEMO", "payload": SAMPLES})
+    r = client.post("/api/evaluations", json={"conversation_id": "demo-ru-001", "model": "openai:unknown"})
+    assert r.status_code == 400
+    assert llm.cost_usd("openai", "gpt-4.1-2025-04-14", 1_000_000, 0) == 2.0

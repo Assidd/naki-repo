@@ -31,9 +31,31 @@ def _price(name: str) -> float:
         return 0.0
 
 
-def cost_usd(provider: str, tokens_in: int, tokens_out: int) -> float | None:
+# Ориентировочные цены USD за 1 млн токенов (вход, выход). Сверяйте с прайсом провайдера;
+# для модели по умолчанию цену можно переопределить в .env (*_PRICE_INPUT_PER_1M / *_PRICE_OUTPUT_PER_1M).
+KNOWN_PRICES = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1": (2.00, 8.00),
+    "o4-mini": (1.10, 4.40),
+}
+
+DEFAULT_OPENAI_MODELS = "gpt-4o-mini,gpt-4.1-mini,gpt-4.1,gpt-4o"
+
+
+def cost_usd(provider: str, model: str, tokens_in: int, tokens_out: int) -> float | None:
     prefix = provider.upper()
     p_in, p_out = _price(f"{prefix}_PRICE_INPUT_PER_1M"), _price(f"{prefix}_PRICE_OUTPUT_PER_1M")
+    default_model = os.getenv(f"{prefix}_MODEL", "").strip()
+    if not (p_in or p_out) or (default_model and not model.startswith(default_model)):
+        # Цена из таблицы: самое длинное совпадающее начало названия модели
+        match = max((k for k in KNOWN_PRICES if model.startswith(k)), key=len, default=None)
+        if match:
+            p_in, p_out = KNOWN_PRICES[match]
+        elif not (default_model and model.startswith(default_model)):
+            return None
     if not p_in and not p_out:
         return None
     return round(tokens_in / 1e6 * p_in + tokens_out / 1e6 * p_out, 6)
@@ -59,9 +81,9 @@ def warm_up() -> None:
 class OpenAIProvider:
     name = "openai"
 
-    def __init__(self):
+    def __init__(self, model: str | None = None):
         self.key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
     @property
     def available(self) -> bool:
@@ -100,9 +122,9 @@ class OpenAIProvider:
 class GeminiProvider:
     name = "gemini"
 
-    def __init__(self):
+    def __init__(self, model: str | None = None):
         self.key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
     @property
     def available(self) -> bool:
@@ -136,15 +158,44 @@ class GeminiProvider:
 PROVIDERS = {"openai": OpenAIProvider, "gemini": GeminiProvider}
 
 
-def provider_chain() -> list:
-    """Основной провайдер + запасной (если для него задан ключ)."""
-    primary = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+def available_models() -> list[dict]:
+    """Модели, которые можно выбрать в интерфейсе: только у провайдеров с ключом.
+    Список задаётся в .env (OPENAI_MODELS / GEMINI_MODELS через запятую)."""
+    out = []
+    lists = {
+        "openai": os.getenv("OPENAI_MODELS", "").strip() or DEFAULT_OPENAI_MODELS,
+        "gemini": os.getenv("GEMINI_MODELS", "").strip() or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+    }
+    for name, cls in PROVIDERS.items():
+        p = cls()
+        if not p.available:
+            continue
+        models = [m.strip() for m in lists[name].split(",") if m.strip()]
+        if p.model not in models:
+            models.insert(0, p.model)
+        for m in models:
+            price = KNOWN_PRICES.get(max((k for k in KNOWN_PRICES if m.startswith(k)), key=len, default=""), None)
+            out.append({"id": f"{name}:{m}", "provider": name, "model": m, "default": m == p.model and name == default_provider(),
+                        "price": {"input_per_1m": price[0], "output_per_1m": price[1]} if price else None})
+    return out
+
+
+def default_provider() -> str:
+    return os.getenv("LLM_PROVIDER", "openai").strip().lower()
+
+
+def provider_chain(model: str | None = None) -> list:
+    """Основной провайдер + запасной (если для него задан ключ).
+    model — «провайдер:модель» из available_models(); тогда она становится основной."""
+    primary, primary_model = default_provider(), None
+    if model:
+        primary, _, primary_model = model.partition(":")
     fallback = os.getenv("LLM_FALLBACK", "gemini").strip().lower()
     chain = []
-    for name in (primary, fallback):
+    for name, m in ((primary, primary_model), (fallback, None)):
         cls = PROVIDERS.get(name)
         if cls and name not in [p.name for p in chain]:
-            p = cls()
+            p = cls(m or None)
             if p.available:
                 chain.append(p)
     return chain
@@ -155,4 +206,5 @@ def status() -> dict:
     return {
         "configured": bool(chain),
         "providers": [{"name": p.name, "model": p.model} for p in chain],
+        "models": available_models(),
     }

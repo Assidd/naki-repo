@@ -3,23 +3,24 @@
   "use strict";
 
   const $view = document.getElementById("view");
-  const state = { filters: { q: "", language: "", channel: "", status: "", critical: false, group: "" }, pollTimer: null };
+  const state = { filters: { q: "", language: "", channel: "", status: "", critical: false, group: "" }, analyticsGroup: "", pollTimer: null, refocus: null };
 
   const LANG = { RU: "Русский", KZ: "Казахский", EN: "Английский" };
   const CHANNEL = { "agent chat": "Чат", "voice call": "Звонок" };
   const STATUS = {
-    none: ["Не оценён", ""],
-    queued: ["В очереди", "info"],
-    running: ["Оценивается…", "info"],
-    done: ["Оценён", "ok"],
-    needs_review: ["Требует проверки", "warn"],
-    failed: ["Ошибка", "bad"],
+    none: ["○", "Не оценён", "", "Оценка ещё не запускалась"],
+    queued: ["…", "В очереди", "info", "Ждёт своей очереди на оценку"],
+    running: ["⟳", "Оценивается", "info", "Модель сейчас оценивает диалог"],
+    done: ["✓", "Оценён", "good", "Оценка готова, все цитаты подтверждены"],
+    needs_review: ["!", "Проверить", "warn", "Часть цитат модели не найдена в диалоге — нужна проверка человеком"],
+    failed: ["✕", "Ошибка", "bad", "Модель не ответила; оценка не выставлена"],
   };
   const SPEAKER = { client: "Клиент", operator: "Оператор", bot: "Бот", system: "Система" };
-  const TYPE = { yes_no: "Да / Нет", scale: "Шкала", flag: "Грубая ошибка (без баллов)" };
+  const TYPE = { yes_no: "Да / Нет", scale: "Шкала", flag: "Грубая ошибка" };
 
   // ---------- утилиты ----------
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const fmt = (n, d = 2) => (n == null || n === "" ? "—" : Number(n).toLocaleString("ru-RU", { minimumFractionDigits: d, maximumFractionDigits: d }));
 
   async function api(path, opts = {}) {
     const init = { headers: { "Content-Type": "application/json" }, ...opts };
@@ -44,37 +45,69 @@
     toast._t = setTimeout(() => (t.hidden = true), error ? 7000 : 3500);
   }
 
-  function answerLabel(criterion, answer) {
-    if (answer == null) return "—";
-    if (answer === "na") return "N/A";
-    if (criterion && criterion.type === "flag") return answer === "yes" ? "Нарушение найдено" : "Нет нарушений";
-    if (answer === "yes") return "Да";
-    if (answer === "no") return "Нет";
-    return answer;
-  }
+  // Подсказка при наведении на любой элемент с data-tip
+  const $tip = document.getElementById("tooltip");
+  document.addEventListener("mousemove", (e) => {
+    const el = e.target.closest("[data-tip]");
+    if (!el) { $tip.hidden = true; return; }
+    $tip.textContent = el.dataset.tip;
+    $tip.hidden = false;
+    const x = Math.min(e.clientX + 14, window.innerWidth - $tip.offsetWidth - 8);
+    const y = Math.min(e.clientY + 16, window.innerHeight - $tip.offsetHeight - 8);
+    $tip.style.left = x + "px";
+    $tip.style.top = y + "px";
+  });
 
+  function band(score) {
+    if (score == null) return ["none", "нет итога"];
+    const s = Number(score);
+    if (s >= 80) return ["good", "хорошо"];
+    if (s >= 50) return ["warn", "средне"];
+    return ["bad", "плохо"];
+  }
+  function scorePill(score) {
+    if (score == null) return '<span class="muted">—</span>';
+    const [cls, label] = band(score);
+    return `<span class="score-pill ${cls}"><b>${fmt(score)}</b><small>${label}</small></span>`;
+  }
+  function statusChip(status) {
+    const [icon, label, cls, tip] = STATUS[status] || STATUS.none;
+    return `<span class="chip ${cls}" data-tip="${esc(tip)}">${icon} ${esc(label)}</span>`;
+  }
+  function answerLabel(c, a) {
+    if (a == null) return "—";
+    if (a === "na") return "N/A";
+    if (c && c.type === "flag") return a === "yes" ? "Нарушение" : "Нет нарушений";
+    if (a === "yes") return "Да";
+    if (a === "no") return "Нет";
+    const top = c && c.scale ? Math.max(...c.scale.map((s) => Number(s.value))) : null;
+    return top ? `${a} из ${top}` : a;
+  }
+  function answerClass(c, a) {
+    if (a === "na") return "";
+    if (c.type === "flag") return a === "yes" ? "bad" : "good";
+    if (a === "yes") return "good";
+    if (a === "no") return "bad";
+    const top = Math.max(...c.scale.map((s) => Number(s.value)));
+    const r = Number(a) / top;
+    return r >= 0.99 ? "good" : r >= 0.5 ? "warn" : "bad";
+  }
   function answerOptions(c) {
     const opts = c.type === "scale" ? c.scale.map((s) => String(s.value)) : ["yes", "no"];
     if (c.na_allowed) opts.push("na");
     return opts;
   }
 
-  function statusBadge(status) {
-    const [label, cls] = STATUS[status] || STATUS.none;
-    return `<span class="badge ${cls}">${esc(label)}</span>`;
-  }
-
   function stopPolling() { clearTimeout(state.pollTimer); state.pollTimer = null; }
   function poll(fn, ms = 2500) { stopPolling(); state.pollTimer = setTimeout(fn, ms); }
 
-  // ---------- шапка ----------
+  // ---------- боковая панель ----------
   async function refreshHeader() {
     try {
       const s = await api("/status");
-      const el = document.getElementById("model-status");
-      el.innerHTML = s.llm.configured
-        ? "Модель: " + s.llm.providers.map((p, i) => `${esc(p.model)}${i ? " (запасная)" : ""}`).join(", ")
-        : '<span class="badge bad">Модель не настроена — укажите OPENAI_API_KEY в .env</span>';
+      document.getElementById("model-status").innerHTML = s.llm.configured
+        ? "Модель оценки<br>" + s.llm.providers.map((p, i) => `<b>${esc(p.model)}</b>${i ? " (запасная)" : ""}`).join("<br>")
+        : '<span class="chip bad">Модель не настроена</span><br>Укажите OPENAI_API_KEY в .env';
       const pill = document.getElementById("appeal-count");
       pill.hidden = !s.open_appeals;
       pill.textContent = s.open_appeals;
@@ -86,10 +119,10 @@
   async function viewList() {
     const [rows, status, checklists] = await Promise.all([api("/conversations"), refreshHeader(), api("/checklists")]);
     const f = state.filters;
-    const evaluated = rows.filter((r) => r.evaluation && r.evaluation.score != null);
-    const avg = evaluated.length ? (evaluated.reduce((a, r) => a + Number(r.evaluation.score), 0) / evaluated.length).toFixed(2) : "—";
-    const criticalCount = rows.filter((r) => r.evaluation && r.evaluation.critical).length;
     const groups = [...new Set(rows.map((r) => r.group_id))];
+    const evaluated = rows.filter((r) => r.evaluation && ["done", "needs_review"].includes(r.evaluation.status)).length;
+    const review = rows.filter((r) => r.evaluation && r.evaluation.status === "needs_review").length;
+    const openAppeals = status ? status.open_appeals : 0;
 
     const filtered = rows.filter((r) => {
       const st = r.evaluation ? r.evaluation.status : "none";
@@ -102,55 +135,61 @@
       return true;
     });
 
+    const step = (n, done, title, text, action) => `
+      <div class="step ${done ? "done" : "todo"}"><span class="num">${done ? "✓" : n}</span>
+        <div><b>${title}</b><p>${text}</p>${action || ""}</div></div>`;
+
     $view.innerHTML = `
-      <h1>Диалоги</h1>
-      <p class="sub">Загрузите набор, выберите версию чек-листа и запустите оценку. Итог и баллы считает сервер по правилам чек-листа.</p>
-      <div class="stats">
-        <div class="stat"><b>${rows.length}</b><span>диалогов (${rows.filter((r) => r.channel === "voice call").length} звонков)</span></div>
-        <div class="stat"><b>${evaluated.length}</b><span>оценено</span></div>
-        <div class="stat"><b>${avg}</b><span>средний итоговый балл</span></div>
-        <div class="stat bad"><b>${criticalCount}</b><span>с грубыми ошибками</span></div>
-        <div class="stat"><b>${status ? status.open_appeals : 0}</b><span>апелляций ждут решения</span></div>
+      <div class="page-head">
+        <div><h1>Диалоги</h1><p class="lead">Загрузите разговоры, запустите оценку по чек-листу и откройте любой диалог, чтобы увидеть баллы, объяснения и реплики-доказательства.</p></div>
+      </div>
+
+      <div class="steps">
+        ${step(1, rows.length > 0, "Загрузите диалоги", rows.length ? `Загружено ${rows.length} (${groups.join(", ")})` : "Из API организаторов или JSON-файлом")}
+        ${step(2, rows.length > 0 && evaluated === rows.length, "Оцените их", rows.length ? `Оценено ${evaluated} из ${rows.length}` : "Модель проверит каждый критерий")}
+        ${step(3, rows.length > 0 && evaluated === rows.length && !review && !openAppeals, "Разберите спорные", `Проверить: ${review} · апелляций ждут решения: ${openAppeals}`,
+          review ? `<button class="btn sm" id="show-review">Показать требующие проверки</button>` : openAppeals ? `<a class="btn sm" href="#/appeals">К апелляциям</a>` : "")}
       </div>
 
       <div class="panel">
-        <h2>Данные и запуск оценки</h2>
+        <div class="panel-head"><h2>Загрузка и запуск оценки</h2></div>
         <div class="row">
-          <label>group_id <input id="group-id" type="text" value="DEV" size="10"></label>
-          <button class="btn" id="fetch-btn" ${status && status.organizer_configured ? "" : 'title="Укажите ORGANIZER_API_URL в .env"'}>Загрузить из API организаторов</button>
-          <label class="btn">Импорт JSON… <input id="import-file" type="file" accept=".json,application/json" hidden></label>
+          <label class="field">Набор (group_id)<input id="group-id" type="text" value="DEV" size="10"></label>
+          <button class="btn" id="fetch-btn" style="align-self:flex-end">↓ Загрузить из API организаторов</button>
+          <label class="btn" style="align-self:flex-end">⇪ Импорт JSON <input id="import-file" type="file" accept=".json,application/json" hidden></label>
           <span class="grow"></span>
-          <label>Чек-лист <select id="checklist-select">${checklists.map((c) => `<option value="${c.id}">v${c.version} — ${esc(c.comment)}</option>`).join("")}</select></label>
-          <button class="btn primary" id="batch-btn">Оценить неоценённые${f.group ? " в " + esc(f.group) : ""}</button>
+          <label class="field">Версия чек-листа<select id="checklist-select">${checklists.map((c) => `<option value="${c.id}">v${c.version} — ${esc(c.comment)}</option>`).join("")}</select></label>
+          <button class="btn primary" id="batch-btn" style="align-self:flex-end">▶ Оценить неоценённые${f.group ? " в " + esc(f.group) : ""}</button>
         </div>
         ${status && !status.organizer_configured ? '<p class="small muted">API организаторов не настроен: впишите ссылку GET в ORGANIZER_API_URL в файле .env. Пока можно загрузить JSON вручную.</p>' : ""}
       </div>
 
       <div class="panel">
-        <div class="row" style="margin-bottom:10px">
-          <input id="f-q" type="text" placeholder="Поиск по ID или тексту" value="${esc(f.q)}" class="grow">
-          <select id="f-group"><option value="">Все наборы</option>${groups.map((g) => `<option ${f.group === g ? "selected" : ""}>${esc(g)}</option>`).join("")}</select>
-          <select id="f-language"><option value="">Все языки</option>${Object.entries(LANG).map(([k, v]) => `<option value="${k}" ${f.language === k ? "selected" : ""}>${v}</option>`).join("")}</select>
-          <select id="f-channel"><option value="">Все каналы</option>${Object.entries(CHANNEL).map(([k, v]) => `<option value="${k}" ${f.channel === k ? "selected" : ""}>${v}</option>`).join("")}</select>
-          <select id="f-status"><option value="">Любой статус</option>${Object.entries(STATUS).map(([k, v]) => `<option value="${k}" ${f.status === k ? "selected" : ""}>${v[0]}</option>`).join("")}</select>
+        <div class="filters">
+          <input id="f-q" type="text" placeholder="Поиск по ID или тексту клиента" value="${esc(f.q)}">
+          <select id="f-group" aria-label="Набор"><option value="">Все наборы</option>${groups.map((g) => `<option ${f.group === g ? "selected" : ""}>${esc(g)}</option>`).join("")}</select>
+          <select id="f-language" aria-label="Язык"><option value="">Все языки</option>${Object.entries(LANG).map(([k, v]) => `<option value="${k}" ${f.language === k ? "selected" : ""}>${v}</option>`).join("")}</select>
+          <select id="f-channel" aria-label="Канал"><option value="">Чаты и звонки</option>${Object.entries(CHANNEL).map(([k, v]) => `<option value="${k}" ${f.channel === k ? "selected" : ""}>${v}</option>`).join("")}</select>
+          <select id="f-status" aria-label="Статус"><option value="">Любой статус</option>${Object.entries(STATUS).map(([k, v]) => `<option value="${k}" ${f.status === k ? "selected" : ""}>${v[1]}</option>`).join("")}</select>
           <label class="chk"><input id="f-critical" type="checkbox" ${f.critical ? "checked" : ""}> Только с грубыми ошибками</label>
         </div>
+        <p class="small muted" style="margin:0 0 8px">Показано ${filtered.length} из ${rows.length}. Итог: <span style="color:var(--good)">●</span> 80–100 хорошо · <span style="color:var(--warn)">●</span> 50–79 средне · <span style="color:var(--bad)">●</span> ниже 50 плохо.</p>
         <div class="table-wrap">
         <table>
-          <thead><tr><th>ID</th><th>Набор</th><th>Канал / язык</th><th>Первая реплика клиента</th><th>Статус</th><th>Итог</th><th>Грубые ошибки</th></tr></thead>
+          <thead><tr><th>Диалог</th><th>Канал</th><th>Язык</th><th>Статус</th><th class="num">Итог</th><th>Грубая ошибка</th></tr></thead>
           <tbody>
             ${filtered.map((r) => {
               const e = r.evaluation;
+              const changed = e && e.score !== e.original_score && e.original_score != null;
               return `<tr class="click" data-id="${esc(r.id)}">
-                <td><b>${esc(r.id)}</b></td>
-                <td>${esc(r.group_id)}</td>
-                <td>${CHANNEL[r.channel] || esc(r.channel)} · ${esc(r.language)}</td>
-                <td class="muted small">${esc(r.preview)}</td>
-                <td>${statusBadge(e ? e.status : "none")}${e && e.open_appeals ? ' <span class="badge warn">апелляция</span>' : ""}</td>
-                <td class="score">${e && e.score != null ? esc(e.score) : "—"}${e && e.score !== e.original_score && e.original_score != null ? `<div class="small muted">исходно ${esc(e.original_score)}</div>` : ""}</td>
-                <td>${e && e.critical ? '<span class="badge bad">Есть</span>' : e && e.critical === false ? '<span class="muted">нет</span>' : ""}</td>
+                <td class="cell-title"><b>${esc(r.id)}</b><span>${esc(r.preview)}</span></td>
+                <td>${r.channel === "voice call" ? "☎ Звонок" : "✉ Чат"}</td>
+                <td>${esc(r.language)}</td>
+                <td>${statusChip(e ? e.status : "none")}${e && e.open_appeals ? ' <span class="chip warn" data-tip="Подана апелляция, ждёт решения">⚖ апелляция</span>' : ""}</td>
+                <td class="num">${e ? scorePill(e.score) : '<span class="muted">—</span>'}${changed ? `<div class="small muted" data-tip="Итог изменён решением по апелляции">было ${fmt(e.original_score)}</div>` : ""}</td>
+                <td>${e && e.critical ? '<span class="chip bad">⚠ Есть</span>' : e && e.critical === false ? '<span class="muted small">нет</span>' : ""}</td>
               </tr>`;
-            }).join("") || `<tr><td colspan="7" class="empty">${rows.length ? "Ничего не найдено — измените фильтры." : "Диалогов пока нет. Загрузите набор из API организаторов или импортируйте JSON."}</td></tr>`}
+            }).join("") || `<tr><td colspan="6"><div class="empty">${rows.length ? "<b>Ничего не найдено</b>Измените или сбросьте фильтры." : "<b>Диалогов пока нет</b>Загрузите набор из API организаторов или импортируйте JSON-файл."}</div></td></tr>`}
           </tbody>
         </table>
         </div>
@@ -166,14 +205,17 @@
     bind("f-q", "q"); bind("f-language", "language"); bind("f-channel", "channel"); bind("f-status", "status"); bind("f-group", "group"); bind("f-critical", "critical", "checked");
 
     $view.querySelectorAll("tr[data-id]").forEach((tr) => tr.addEventListener("click", () => (location.hash = "#/c/" + encodeURIComponent(tr.dataset.id))));
+    document.getElementById("show-review")?.addEventListener("click", () => { state.filters.status = "needs_review"; render(); });
 
     document.getElementById("fetch-btn").addEventListener("click", async (e) => {
-      e.target.disabled = true;
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "Загрузка…";
       try {
         const r = await api("/dataset/fetch", { method: "POST", body: { group_id: document.getElementById("group-id").value } });
         toast(`Загружено ${r.total} диалогов (${r.group_id}): новых ${r.created}, обновлено ${r.updated}`);
         render();
-      } catch (err) { toast(err.message, true); e.target.disabled = false; }
+      } catch (err) { toast(err.message, true); render(); }
     });
 
     document.getElementById("import-file").addEventListener("change", async (e) => {
@@ -190,14 +232,14 @@
     });
 
     document.getElementById("batch-btn").addEventListener("click", async (e) => {
-      e.target.disabled = true;
+      e.currentTarget.disabled = true;
       try {
         const body = { checklist_id: Number(document.getElementById("checklist-select").value), only_unevaluated: true };
         if (f.group) body.group_id = f.group;
         const r = await api("/evaluations/batch", { method: "POST", body });
         toast(r.started.length ? `Запущено оценок: ${r.started.length}` : "Все диалоги уже оценены этой версией чек-листа");
         render();
-      } catch (err) { toast(err.message, true); e.target.disabled = false; }
+      } catch (err) { toast(err.message, true); render(); }
     });
 
     if (state.refocus) {
@@ -208,7 +250,7 @@
     if (rows.some((r) => r.evaluation && ["queued", "running"].includes(r.evaluation.status))) poll(render);
   }
 
-  // Позиция реплики в записи звонка: время от начала, без интервалов, когда запись стояла на паузе
+  // Позиция реплики в записи звонка: время от начала без интервалов, когда запись стояла на паузе
   // (системные сообщения «Запись … приостановлены» / «… возобновлены»). Это оценка, а не точная синхронизация.
   function audioOffsets(transcript) {
     const out = {};
@@ -230,61 +272,62 @@
 
   // ---------- карточка диалога ----------
   async function viewCard(cid, evalId) {
-    const conv = await api("/conversations/" + encodeURIComponent(cid));
-    const checklists = await api("/checklists");
+    const [conv, checklists] = await Promise.all([api("/conversations/" + encodeURIComponent(cid)), api("/checklists")]);
     const eid = evalId || conv.latest_evaluation_id;
     const ev = eid ? await api("/evaluations/" + eid) : null;
     const isCall = conv.channel === "voice call";
     const offsets = isCall ? audioOffsets(conv.transcript) : {};
-    const firstTs = NaN;
 
     $view.innerHTML = `
-      <p><a href="#/">← Все диалоги</a></p>
-      <h1>${esc(conv.id)}</h1>
-      <p class="sub">${CHANNEL[conv.channel] || esc(conv.channel)} · ${LANG[conv.language] || esc(conv.language)} · набор ${esc(conv.group_id)} · ${conv.transcript.length} реплик</p>
+      <a class="back" href="#/">← Все диалоги</a>
+      <div class="page-head">
+        <div><h1>${esc(conv.id)}</h1>
+          <div class="row"><span class="chip">${isCall ? "☎ Звонок" : "✉ Чат"}</span><span class="chip">${LANG[conv.language] || esc(conv.language)}</span>
+          <span class="chip">Набор ${esc(conv.group_id)}</span><span class="chip">${conv.transcript.length} реплик</span></div></div>
+        <div class="row">
+          <label class="field">Версия чек-листа<select id="run-checklist">${checklists.map((c) => `<option value="${c.id}" ${ev && ev.checklist_id === c.id ? "selected" : ""}>v${c.version} — ${esc(c.comment)}</option>`).join("")}</select></label>
+          <button class="btn primary" id="run-btn" style="align-self:flex-end" ${ev && ["queued", "running"].includes(ev.status) ? "disabled" : ""}>${ev ? "↻ Оценить заново" : "▶ Запустить оценку"}</button>
+        </div>
+      </div>
+      ${conv.evaluations.length > 1 ? `<div class="row small" style="margin:-6px 0 12px"><span class="muted">История оценок:</span>
+        <select id="history">${conv.evaluations.map((e) => `<option value="${e.id}" ${ev && e.id === ev.id ? "selected" : ""}>#${e.id} · ${esc(e.created_at.slice(0, 16).replace("T", " "))} · ${STATUS[e.status]?.[1] || e.status}${e.score ? " · " + e.score : ""}</option>`).join("")}</select></div>` : ""}
       <div class="card-grid">
+        <section id="result"></section>
         <section class="panel transcript" id="transcript">
-          <h2>Транскрипт</h2>
+          <div class="panel-head"><h2>Транскрипт</h2><span class="small muted">клик по цитате слева — переход к реплике</span></div>
+          <div class="who-legend"><span><i style="background:var(--brand-soft)"></i>Оператор</span><span><i style="background:var(--surface-2)"></i>Клиент</span><span><i></i>Бот и система — контекст</span></div>
           ${isCall && conv.audio_url ? `
-            <div class="panel" style="padding:10px">
+            <div style="margin-bottom:10px">
               <audio id="audio" controls preload="none" src="/api/conversations/${encodeURIComponent(conv.id)}/audio" style="width:100%"></audio>
-              <div class="small muted">Если плеер не воспроизводит запись — <a href="${esc(conv.audio_url)}" target="_blank" rel="noopener">откройте её в плеере организаторов</a>. Клик по цитате перематывает запись к реплике.</div>
+              <div class="small muted">Клик по цитате перематывает запись к реплике (приблизительно). <a href="${esc(conv.audio_url)}" target="_blank" rel="noopener">Плеер организаторов</a></div>
             </div>` : ""}
           ${conv.transcript.map((m) => `
-            <div class="msg ${esc(m.speaker)}" id="msg-${esc(m.id)}" data-ts="${esc(m.timestamp)}" data-offset="${offsets[m.id] ?? ""}">
+            <div class="msg ${esc(m.speaker)}" id="msg-${esc(m.id)}" data-offset="${offsets[m.id] ?? ""}">
               <div class="id">${esc(m.id)}</div>
-              <div><span class="who">${SPEAKER[m.speaker] || esc(m.speaker)}</span><span class="ts">${esc(m.timestamp)}</span><div class="text">${esc(m.text)}</div></div>
+              <div><span class="who">${SPEAKER[m.speaker] || esc(m.speaker)}</span><span class="ts">${esc(isCall ? m.timestamp.slice(11, 19) : m.timestamp)}</span><div class="text">${esc(m.text)}</div></div>
             </div>`).join("")}
         </section>
-        <section id="result"></section>
       </div>`;
 
     const $result = document.getElementById("result");
-    const runBar = `
-      <div class="panel row">
-        <label>Чек-лист <select id="run-checklist">${checklists.map((c) => `<option value="${c.id}" ${ev && ev.checklist_id === c.id ? "selected" : ""}>v${c.version} — ${esc(c.comment)}</option>`).join("")}</select></label>
-        <button class="btn primary" id="run-btn" ${ev && ["queued", "running"].includes(ev.status) ? "disabled" : ""}>${ev ? "Оценить заново" : "Запустить оценку"}</button>
-        ${conv.evaluations.length > 1 ? `<label class="grow" style="text-align:right">История <select id="history">${conv.evaluations.map((e) => `<option value="${e.id}" ${ev && e.id === ev.id ? "selected" : ""}>#${e.id} · ${esc(e.created_at.slice(0, 16).replace("T", " "))} · ${STATUS[e.status]?.[0] || e.status}${e.score ? " · " + e.score : ""}</option>`).join("")}</select></label>` : ""}
-      </div>`;
-
     if (!ev) {
-      $result.innerHTML = runBar + '<div class="panel empty">Диалог ещё не оценён.</div>';
+      $result.innerHTML = '<div class="panel empty"><b>Диалог ещё не оценён</b>Выберите версию чек-листа и нажмите «Запустить оценку».</div>';
     } else if (["queued", "running"].includes(ev.status)) {
-      $result.innerHTML = runBar + `<div class="panel empty">${statusBadge(ev.status)}<p>Модель оценивает диалог. Страница обновится автоматически.</p></div>`;
+      $result.innerHTML = `<div class="panel empty">${statusChip(ev.status)}<p>Модель оценивает диалог. Страница обновится сама.</p></div>`;
       poll(() => viewCard(cid, ev.id));
     } else if (ev.status === "failed") {
-      $result.innerHTML = runBar + `<div class="panel">${statusBadge("failed")}<p>${esc(ev.error)}</p><p class="small muted">Ошибка модели не превращается в нулевую оценку. Исправьте настройку и запустите оценку заново.</p></div>`;
+      $result.innerHTML = `<div class="panel">${statusChip("failed")}<p>${esc(ev.error)}</p><p class="small muted">Ошибка модели не превращается в нулевую оценку. Исправьте настройку и запустите оценку заново.</p></div>`;
     } else {
-      $result.innerHTML = runBar + renderEvaluation(ev);
-      bindEvaluation(ev, cid, firstTs);
+      $result.innerHTML = renderEvaluation(ev);
+      bindEvaluation(ev, cid);
     }
 
     document.getElementById("run-btn").addEventListener("click", async (e) => {
-      e.target.disabled = true;
+      e.currentTarget.disabled = true;
       try {
         const r = await api("/evaluations", { method: "POST", body: { conversation_id: cid, checklist_id: Number(document.getElementById("run-checklist").value) } });
         viewCard(cid, r.id);
-      } catch (err) { toast(err.message, true); e.target.disabled = false; }
+      } catch (err) { toast(err.message, true); e.currentTarget.disabled = false; }
     });
     const hist = document.getElementById("history");
     if (hist) hist.addEventListener("change", () => viewCard(cid, Number(hist.value)));
@@ -293,62 +336,94 @@
   function renderEvaluation(ev) {
     const cl = ev.checklist.data;
     const final = ev.final || {};
-    const sections = Object.fromEntries((cl.sections || []).map((s) => [s.id, s.title]));
+    const sectionTitles = Object.fromEntries((cl.sections || []).map((s) => [s.id, s.title]));
     const appealsBy = Object.fromEntries(ev.appeals.map((a) => [a.criterion_id, a]));
     const scoreChanged = final.score !== ev.score;
+    const [bcls, blabel] = band(final.score);
+
+    // Критерии группируем по разделам чек-листа, в порядке чек-листа
+    const order = [];
+    for (const c of cl.criteria) {
+      const sid = c.section || "";
+      let g = order.find((x) => x.id === sid);
+      if (!g) order.push((g = { id: sid, items: [] }));
+      g.items.push(c);
+    }
+
     return `
       <div class="panel">
-        <div class="row">
-          <div><div class="small muted">Итоговый балл</div><div class="score-big">${final.score ?? "—"}<span class="small muted"> / 100</span></div></div>
-          ${scoreChanged ? `<div><div class="small muted">Исходная оценка модели</div><div class="score">${ev.score ?? "—"}</div></div>` : ""}
-          <span class="grow"></span>
-          <div style="text-align:right">${statusBadge(ev.status)}<div class="small muted">Чек-лист v${ev.checklist.version} · ${esc(ev.model || "")}</div>
-          <div class="small muted">Токены ${ev.tokens_in ?? 0} / ${ev.tokens_out ?? 0}${ev.cost_usd != null ? ` · ≈ $${Number(ev.cost_usd).toFixed(5)}` : ""}</div></div>
-        </div>
-        ${final.critical ? '<div class="critical-banner">⚠ Обнаружена грубая ошибка — см. критерий «Грубые ошибки»</div>' : ""}
-        ${ev.status === "needs_review" ? `<div class="issues"><b>Требует проверки:</b> часть доказательств модели не подтвердилась в тексте диалога. Баллы показаны, но проверьте отмеченные критерии.<ul>${ev.issues.map((i) => `<li>${esc(i)}</li>`).join("")}</ul></div>` : ""}
-        ${Object.keys(final.sections || {}).length ? `<div class="row small">${Object.entries(final.sections).map(([k, v]) => `<span class="badge info">${esc(sections[k] || k)}: ${v}%</span>`).join("")}</div>` : ""}
-      </div>
-      ${cl.criteria.map((c) => {
-        const r = ev.results[c.id];
-        if (!r) return "";
-        const finalAnswer = final.answers ? final.answers[c.id] : r.answer;
-        const fc = (final.criteria || {})[c.id] || {};
-        const appeal = appealsBy[c.id];
-        const changed = finalAnswer !== r.answer;
-        return `
-        <div class="crit ${changed ? "changed" : ""}" id="crit-${esc(c.id)}">
-          <div class="crit-head">
-            <h3>${esc(c.title)} <span class="small muted">${TYPE[c.type]}${c.type !== "flag" ? " · вес " + esc(c.weight) : ""}</span></h3>
-            <div>
-              ${changed ? `<s class="muted">${esc(answerLabel(c, r.answer))}</s> → ` : ""}
-              <span class="badge ${c.type === "flag" ? (finalAnswer === "yes" ? "bad" : "ok") : finalAnswer === "na" ? "" : finalAnswer === "no" || finalAnswer === "0" ? "bad" : "ok"}">${esc(answerLabel(c, finalAnswer))}</span>
-              ${c.type !== "flag" ? `<span class="small muted"> ${fc.share != null ? `${fc.share} из ${fc.max_share} б.` : "не учитывается (N/A)"}</span>` : ""}
-            </div>
+        <div class="summary">
+          <div class="score-ring ${bcls}" style="--p:${final.score ?? 0}" role="img" aria-label="Итог ${final.score ?? "нет"} из 100">
+            <div><span><b>${final.score != null ? fmt(final.score) : "—"}</b><small>из 100 · ${blabel}</small></span></div>
           </div>
-          <p>${esc(r.explanation)}</p>
-          ${r.evidence.length ? `<ul class="evidence">${r.evidence.map((e) => `<li><span class="quote ${e.verified ? "" : "unverified"}" data-msg="${esc(e.message_id)}" data-quote="${esc(e.quote)}" title="${e.verified ? "Цитата найдена в реплике" : "Цитата НЕ найдена в реплике"}">${esc(e.message_id)}: «${esc(e.quote)}»</span>${e.verified ? "" : ' <span class="badge bad">не подтверждено</span>'}</li>`).join("")}</ul>` : ""}
-          ${r.checked_range ? `<p class="small">Проверенный участок: <button class="btn link range" data-range="${esc(r.checked_range)}">${esc(r.checked_range)}</button></p>` : ""}
-          ${appeal ? renderAppealInfo(c, appeal) : `<button class="btn small appeal-open" data-crit="${esc(c.id)}">Оспорить</button>
-            <div class="appeal-box" id="appeal-form-${esc(c.id)}" hidden>
-              <textarea placeholder="Почему вы не согласны с оценкой?"></textarea>
-              <div class="row" style="margin-top:6px"><button class="btn primary appeal-send" data-crit="${esc(c.id)}">Подать апелляцию</button></div>
-            </div>`}
-        </div>`;
-      }).join("")}`;
+          <div class="facts">
+            <div class="row">${statusChip(ev.status)}${final.critical ? '<span class="chip bad">⚠ Грубая ошибка</span>' : '<span class="chip good">Грубых ошибок нет</span>'}</div>
+            ${scoreChanged ? `<div class="small">Исходная оценка модели: <b>${fmt(ev.score)}</b> → после апелляций: <b>${fmt(final.score)}</b></div>` : ""}
+            <div class="small muted">Чек-лист v${ev.checklist.version} · ${esc(ev.model || "")}</div>
+            <div class="small muted">Токены ${ev.tokens_in ?? 0} / ${ev.tokens_out ?? 0}${ev.cost_usd != null ? ` · стоимость ≈ $${Number(ev.cost_usd).toFixed(4)}` : ""}</div>
+            ${Object.keys(final.sections || {}).length ? `<div class="sections">${Object.entries(final.sections).map(([k, v]) => `
+              <div class="hbar" data-tip="${esc(sectionTitles[k] || k)}: ${v}% от максимума раздела"><div class="name small">${esc(sectionTitles[k] || k)}</div>
+              <div class="track"><div class="fill" style="width:${v}%"></div></div><div class="val">${fmt(v, 0)}%</div></div>`).join("")}</div>` : ""}
+          </div>
+        </div>
+        ${final.critical ? '<div class="banner bad">⚠ <div><b>Обнаружена грубая ошибка.</b> Она отмечается отдельно и не входит в баллы — см. раздел «Грубые нарушения».</div></div>' : ""}
+        ${ev.status === "needs_review" ? `<div class="banner warn">! <div><b>Нужна проверка человеком.</b> Часть доказательств модели не нашлась в тексте диалога. Баллы показаны, но проверьте отмеченные критерии.<ul>${ev.issues.map((i) => `<li>${esc(i)}</li>`).join("")}</ul></div></div>` : ""}
+      </div>
+
+      <details class="help"><summary>Как читать оценку</summary><ul>
+        <li><b>Баллы критерия</b> — сколько он принёс в итог из 100 с учётом перераспределения веса.</li>
+        <li><b>N/A</b> — критерий неприменим к этому диалогу; его вес распределён между остальными.</li>
+        <li><b>Цитата</b> — реплика, на которой основан вывод. Нажмите на неё, чтобы перейти к ней в транскрипте. Красная полоса — цитата не найдена в диалоге.</li>
+        <li><b>Проверенный участок</b> — где ожидалось пропущенное действие.</li>
+        <li>Не согласны с оценкой — нажмите «Оспорить» у критерия.</li>
+      </ul></details>
+
+      <div class="panel">
+        <h2>Оценка по критериям</h2>
+        ${order.map((g) => `
+          ${g.id ? `<div class="section-title">${esc(sectionTitles[g.id] || g.id)}${final.sections && final.sections[g.id] != null ? ` · ${fmt(final.sections[g.id], 0)}%` : ""}</div>` : ""}
+          ${g.items.map((c) => renderCriterion(c, ev.results[c.id], final, appealsBy[c.id])).join("")}`).join("")}
+      </div>`;
+  }
+
+  function renderCriterion(c, r, final, appeal) {
+    if (!r) return "";
+    const fa = final.answers ? final.answers[c.id] : r.answer;
+    const fc = (final.criteria || {})[c.id] || {};
+    const changed = fa !== r.answer;
+    const pct = fc.share != null && Number(fc.max_share) ? (Number(fc.share) / Number(fc.max_share)) * 100 : null;
+    return `
+      <div class="crit ${changed ? "changed" : ""} ${c.type === "flag" && fa === "yes" ? "flagged" : ""}" id="crit-${esc(c.id)}">
+        <div class="crit-head">
+          <div><h3>${esc(c.title)}</h3><span class="meta">${TYPE[c.type]}${c.type !== "flag" ? " · вес " + esc(c.weight) : ""}</span></div>
+          <div class="crit-score">
+            ${changed ? `<s class="small muted">${esc(answerLabel(c, r.answer))}</s> ` : ""}<span class="chip ${answerClass(c, fa)}">${esc(answerLabel(c, fa))}</span>
+            ${c.type !== "flag" ? `<span class="pts">${fc.share != null ? `${fmt(fc.share)} из ${fmt(fc.max_share)} б.` : "не учитывается (N/A)"}</span>` : ""}
+          </div>
+        </div>
+        ${pct != null ? `<div class="track" data-tip="Выполнено на ${fmt(pct, 0)}%"><div class="fill" style="width:${pct}%"></div></div>` : ""}
+        <p>${esc(r.explanation)}</p>
+        ${r.evidence.length ? `<ul class="evidence">${r.evidence.map((e) => `<li><button class="quote ${e.verified ? "" : "unverified"}" data-msg="${esc(e.message_id)}" data-quote="${esc(e.quote)}" data-tip="${e.verified ? "Цитата найдена в реплике — нажмите, чтобы перейти" : "Цитата НЕ найдена в реплике"}"><span class="mono">${esc(e.message_id)}</span>«${esc(e.quote)}»</button></li>`).join("")}</ul>` : ""}
+        ${r.checked_range ? `<div class="small" style="margin-top:6px">Проверенный участок: <button class="btn link range" data-range="${esc(r.checked_range)}">${esc(r.checked_range)}</button></div>` : ""}
+        ${appeal ? renderAppealInfo(c, appeal) : `<div class="crit-actions"><button class="btn sm ghost appeal-open" data-crit="${esc(c.id)}">⚖ Оспорить</button></div>
+          <div class="appeal-box" id="appeal-form-${esc(c.id)}" hidden>
+            <textarea placeholder="Почему вы не согласны с оценкой? Проверяющий увидит этот комментарий."></textarea>
+            <div class="row" style="margin-top:6px"><button class="btn primary sm appeal-send" data-crit="${esc(c.id)}">Подать апелляцию</button></div>
+          </div>`}
+      </div>`;
   }
 
   function renderAppealInfo(c, a) {
     if (a.status === "open") {
-      return `<div class="appeal-box"><span class="badge warn">Апелляция на рассмотрении</span> <span class="small">${esc(a.comment)}</span>
-        <div class="small"><a href="#/appeals/${a.id}">Открыть рассмотрение →</a></div></div>`;
+      return `<div class="appeal-box"><span class="chip warn">⚖ Апелляция на рассмотрении</span> <span class="small">${esc(a.comment)}</span>
+        <div class="small" style="margin-top:4px"><a href="#/appeals/${a.id}">Открыть рассмотрение →</a></div></div>`;
     }
-    return `<div class="appeal-box"><span class="badge ${a.decision === "change" ? "warn" : "ok"}">${a.decision === "change" ? "Оценка изменена проверяющим" : "Оценка подтверждена проверяющим"}</span>
-      <div class="small"><b>Апелляция:</b> ${esc(a.comment)}</div>
+    return `<div class="appeal-box"><span class="chip ${a.decision === "change" ? "warn" : "good"}">${a.decision === "change" ? "Оценка изменена проверяющим" : "Оценка подтверждена проверяющим"}</span>
+      <div class="small" style="margin-top:4px"><b>Апелляция:</b> ${esc(a.comment)}</div>
       <div class="small"><b>Решение:</b> ${a.decision === "change" ? `новый ответ «${esc(answerLabel(c, a.new_answer))}». ` : ""}${esc(a.reason)}</div></div>`;
   }
 
-  function highlightMessage(id, quote, firstTs) {
+  function highlightMessage(id, quote) {
     document.querySelectorAll(".msg.hl").forEach((m) => m.classList.remove("hl"));
     document.querySelectorAll(".msg mark").forEach((mk) => mk.replaceWith(mk.textContent));
     const el = document.getElementById("msg-" + id);
@@ -374,14 +449,14 @@
     }
   }
 
-  function bindEvaluation(ev, cid, firstTs) {
-    $view.querySelectorAll(".quote").forEach((q) => q.addEventListener("click", () => highlightMessage(q.dataset.msg, q.dataset.quote, firstTs)));
+  function bindEvaluation(ev, cid) {
+    $view.querySelectorAll(".quote").forEach((q) => q.addEventListener("click", () => highlightMessage(q.dataset.msg, q.dataset.quote)));
     $view.querySelectorAll(".range").forEach((b) => b.addEventListener("click", () => {
       document.querySelectorAll(".msg.range").forEach((m) => m.classList.remove("range"));
       const ids = (b.dataset.range.match(/m\d+/g) || []).map((s) => Number(s.slice(1)));
       const [from, to] = [Math.min(...ids), Math.max(...ids)];
       for (let i = from; i <= to; i++) document.getElementById("msg-m" + i)?.classList.add("range");
-      highlightMessage("m" + from, null, firstTs);
+      highlightMessage("m" + from, null);
     }));
     $view.querySelectorAll(".appeal-open").forEach((b) => b.addEventListener("click", () => {
       const form = document.getElementById("appeal-form-" + b.dataset.crit);
@@ -399,6 +474,100 @@
     }));
   }
 
+  // ---------- аналитика ----------
+  function hbars(items, { max = 100, unit = "%", digits = 0 } = {}) {
+    return `<div class="hbars">${items.map((it) => {
+      const na = it.value == null;
+      const w = na ? 0 : Math.max(0, Math.min(100, (it.value / max) * 100));
+      return `<div class="hbar ${na ? "na" : ""}" data-tip="${esc(it.tip || "")}">
+        <div class="name">${esc(it.name)}${it.sub ? `<small>${esc(it.sub)}</small>` : ""}</div>
+        <div class="track"><div class="fill" style="width:${w}%"></div></div>
+        <div class="val">${na ? "—" : fmt(it.value, digits) + unit}${it.note ? `<small>${esc(it.note)}</small>` : ""}</div>
+      </div>`;
+    }).join("")}</div>`;
+  }
+
+  async function viewAnalytics() {
+    refreshHeader();
+    const g = state.analyticsGroup;
+    const a = await api("/analytics" + (g ? "?group_id=" + encodeURIComponent(g) : ""));
+    const st = a.statuses;
+    const evaluated = st.done + st.needs_review;
+    const maxBucket = Math.max(1, ...a.distribution.map((d) => d.count));
+    const scored = a.distribution.reduce((s, d) => s + d.count, 0);
+    const weighted = a.criteria.filter((c) => c.type !== "flag");
+    const flags = a.criteria.filter((c) => c.type === "flag");
+
+    $view.innerHTML = `
+      <div class="page-head">
+        <div><h1>Аналитика</h1><p class="lead">Сводка по последней оценке каждого диалога с учётом решений по апелляциям. Помогает увидеть, где операторы теряют баллы чаще всего.</p></div>
+        <label class="field">Набор<select id="a-group"><option value="">Все наборы</option>${a.groups.map((x) => `<option ${g === x ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>
+      </div>
+
+      ${evaluated === 0 ? `<div class="panel empty"><b>Пока нет оценённых диалогов</b>Запустите оценку на странице «Диалоги» — здесь появится сводка.</div>` : `
+      <div class="kpis">
+        <div class="kpi"><div class="label">Оценено диалогов</div><div class="value">${evaluated}<small> из ${a.total}</small></div><div class="note">${st.none ? `${st.none} ещё не оценены` : "все диалоги оценены"}</div></div>
+        <div class="kpi"><div class="label">Средний итоговый балл</div><div class="value">${fmt(a.avg_score)}</div><div class="note">медиана ${fmt(a.median_score)}</div></div>
+        <div class="kpi ${a.critical.length ? "alert" : ""}"><div class="label">С грубыми ошибками</div><div class="value">${a.critical.length}</div><div class="note">${evaluated ? fmt((a.critical.length / evaluated) * 100, 1) + "% диалогов" : ""}</div></div>
+        <div class="kpi"><div class="label">Требуют проверки</div><div class="value">${st.needs_review}</div><div class="note">${st.failed ? `ошибок модели: ${st.failed}` : "цитаты не подтвердились"}</div></div>
+        <div class="kpi"><div class="label">Апелляции</div><div class="value">${a.appeals.total}</div><div class="note">ждут: ${a.appeals.open} · изменено: ${a.appeals.changed} · подтверждено: ${a.appeals.confirmed}</div></div>
+        <div class="kpi"><div class="label">Стоимость оценки</div><div class="value">$${fmt(a.cost.total_usd, 3)}</div><div class="note">≈ $${fmt(a.cost.per_evaluation_usd, 4)} за диалог</div></div>
+      </div>
+
+      <div class="charts">
+        <div class="panel">
+          <div class="panel-head"><h2>Где теряются баллы</h2><span class="small muted">выполнение критерия, % от максимума</span></div>
+          ${hbars(weighted.map((c) => ({
+            name: c.title, sub: `вес ${c.weight}`, value: c.fulfilment,
+            note: c.na ? `N/A: ${c.na}` : "",
+            tip: `${c.title}: в среднем ${fmt(c.fulfilment, 1)}% от максимума · оценено ${c.evaluated - c.na}, N/A ${c.na}`,
+          })))}
+          <p class="legend-note">Чем короче полоса, тем чаще операторы не выполняют критерий. N/A (неприменим) в процент не входит.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Распределение итоговых баллов</h2><span class="small muted">число диалогов</span></div>
+          <div class="vbars">${a.distribution.map((d) => `
+            <div class="vbar" data-tip="Итог ${d.label}: ${d.count} диал. (${scored ? fmt((d.count / scored) * 100, 0) : 0}%)">
+              <span class="v">${d.count}</span><div class="col" style="height:${(d.count / maxBucket) * 100}%"></div></div>`).join("")}</div>
+          <div class="vlabels">${a.distribution.map((d) => `<span>${d.label}</span>`).join("")}</div>
+          <p class="legend-note">Диалоги без итога (все критерии N/A) сюда не входят.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Средний балл по языкам</h2></div>
+          ${hbars(a.by_language.map((x) => ({ name: LANG[x.key] || x.key, sub: `${x.count} диал.`, value: x.avg, tip: `${LANG[x.key] || x.key}: средний итог ${fmt(x.avg)} по ${x.count} диалогам` })), { unit: "", digits: 1 })}
+          <div class="section-title">По каналам</div>
+          ${hbars(a.by_channel.map((x) => ({ name: CHANNEL[x.key] || x.key, sub: `${x.count} диал.`, value: x.avg, tip: `${CHANNEL[x.key] || x.key}: средний итог ${fmt(x.avg)} по ${x.count} диалогам` })), { unit: "", digits: 1 })}
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Грубые ошибки</h2><span class="small muted">${flags.map((f) => esc(f.title)).join(", ")}</span></div>
+          ${a.critical.length ? `<div class="table-wrap"><table><thead><tr><th>Диалог</th><th>Что найдено</th><th class="num">Итог</th></tr></thead><tbody>
+            ${a.critical.map((c) => `<tr class="click" data-id="${esc(c.conversation_id)}"><td><b>${esc(c.conversation_id)}</b><div class="small muted">${CHANNEL[c.channel] || ""} · ${esc(c.language)}${c.status === "needs_review" ? " · требует проверки" : ""}</div></td><td class="small">${esc(c.reason)}</td><td class="num">${scorePill(c.score)}</td></tr>`).join("")}
+          </tbody></table></div>` : '<div class="empty"><b>Грубых ошибок не найдено</b></div>'}
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>10 диалогов с самым низким итогом</h2><span class="small muted">кандидаты для разбора с операторами</span></div>
+        <div class="table-wrap"><table><thead><tr><th>Диалог</th><th>Канал</th><th>Язык</th><th>Статус</th><th class="num">Итог</th></tr></thead><tbody>
+          ${a.lowest.map((r) => `<tr class="click" data-id="${esc(r.conversation_id)}"><td><b>${esc(r.conversation_id)}</b>${r.critical ? ' <span class="chip bad">⚠</span>' : ""}</td><td>${CHANNEL[r.channel] || ""}</td><td>${esc(r.language)}</td><td>${statusChip(r.status)}</td><td class="num">${scorePill(r.score)}</td></tr>`).join("")}
+        </tbody></table></div>
+      </div>
+
+      <details class="panel"><summary><b>Таблица по критериям</b> <span class="small muted">точные значения</span></summary>
+        <div class="table-wrap" style="margin-top:10px"><table><thead><tr><th>Критерий</th><th>Тип</th><th class="num">Вес</th><th class="num">Оценено</th><th class="num">N/A</th><th class="num">Выполнение</th><th class="num">Нарушений</th></tr></thead><tbody>
+          ${a.criteria.map((c) => `<tr><td>${esc(c.title)}</td><td>${TYPE[c.type]}</td><td class="num">${c.weight}</td><td class="num">${c.evaluated}</td><td class="num">${c.na}</td><td class="num">${c.type === "flag" ? "—" : fmt(c.fulfilment, 1) + "%"}</td><td class="num">${c.type === "flag" ? c.violations : "—"}</td></tr>`).join("")}
+        </tbody></table></div>
+        <p class="legend-note">Токенов использовано: ${a.cost.tokens_in.toLocaleString("ru-RU")} входных, ${a.cost.tokens_out.toLocaleString("ru-RU")} выходных за ${a.cost.evaluations} оценок.</p>
+      </details>`}`;
+
+    document.getElementById("a-group").addEventListener("change", (e) => { state.analyticsGroup = e.target.value; render(); });
+    $view.querySelectorAll("tr[data-id]").forEach((tr) => tr.addEventListener("click", () => (location.hash = "#/c/" + encodeURIComponent(tr.dataset.id))));
+    if (st.queued || st.running) poll(render, 4000);
+  }
+
   // ---------- апелляции ----------
   async function viewAppeals(appealId) {
     const list = await api("/appeals");
@@ -406,17 +575,16 @@
     if (appealId) return viewAppealReview(list.find((a) => a.id === appealId));
     const open = list.filter((a) => a.status === "open");
     const done = list.filter((a) => a.status !== "open");
-    const rowsHtml = (arr) => arr.map((a) => `<tr class="click" data-id="${a.id}"><td>#${a.id}</td><td>${esc(a.conversation_id)}</td><td>${esc(a.criterion_id)}</td><td class="small">${esc(a.comment)}</td><td>${a.status === "open" ? '<span class="badge warn">Ждёт решения</span>' : a.decision === "change" ? '<span class="badge warn">Изменена</span>' : '<span class="badge ok">Подтверждена</span>'}</td></tr>`).join("");
+    const rowsHtml = (arr) => arr.map((a) => `<tr class="click" data-id="${a.id}"><td>#${a.id}</td><td><b>${esc(a.conversation_id)}</b></td><td>${esc(a.criterion_id)}</td><td class="small">${esc(a.comment)}</td><td>${a.status === "open" ? '<span class="chip warn">Ждёт решения</span>' : a.decision === "change" ? '<span class="chip warn">Изменена</span>' : '<span class="chip good">Подтверждена</span>'}</td></tr>`).join("");
     $view.innerHTML = `
-      <h1>Апелляции</h1>
-      <p class="sub">Проверяющий изучает спорную оценку, комментарий и фрагмент диалога, затем подтверждает или меняет оценку. Исходная оценка модели сохраняется.</p>
-      <div class="panel"><h2>Ждут решения (${open.length})</h2><div class="table-wrap"><table><thead><tr><th>№</th><th>Диалог</th><th>Критерий</th><th>Комментарий</th><th>Статус</th></tr></thead><tbody>${rowsHtml(open) || '<tr><td colspan="5" class="empty">Открытых апелляций нет</td></tr>'}</tbody></table></div></div>
-      <div class="panel"><h2>Рассмотренные (${done.length})</h2><div class="table-wrap"><table><thead><tr><th>№</th><th>Диалог</th><th>Критерий</th><th>Комментарий</th><th>Решение</th></tr></thead><tbody>${rowsHtml(done) || '<tr><td colspan="5" class="empty">Пока нет</td></tr>'}</tbody></table></div></div>`;
+      <div class="page-head"><div><h1>Апелляции</h1><p class="lead">Проверяющий изучает спорную оценку, объяснение модели, комментарий и фрагмент диалога, затем подтверждает или меняет оценку. Исходная оценка модели всегда сохраняется.</p></div></div>
+      <div class="panel"><h2>Ждут решения (${open.length})</h2><div class="table-wrap"><table><thead><tr><th>№</th><th>Диалог</th><th>Критерий</th><th>Комментарий</th><th>Статус</th></tr></thead><tbody>${rowsHtml(open) || '<tr><td colspan="5"><div class="empty"><b>Открытых апелляций нет</b>Подать апелляцию можно в карточке диалога кнопкой «Оспорить».</div></td></tr>'}</tbody></table></div></div>
+      <div class="panel"><h2>Рассмотренные (${done.length})</h2><div class="table-wrap"><table><thead><tr><th>№</th><th>Диалог</th><th>Критерий</th><th>Комментарий</th><th>Решение</th></tr></thead><tbody>${rowsHtml(done) || '<tr><td colspan="5"><div class="empty">Пока нет</div></td></tr>'}</tbody></table></div></div>`;
     $view.querySelectorAll("tr[data-id]").forEach((tr) => tr.addEventListener("click", () => (location.hash = "#/appeals/" + tr.dataset.id)));
   }
 
   async function viewAppealReview(appeal) {
-    if (!appeal) { $view.innerHTML = '<div class="panel empty">Апелляция не найдена. <a href="#/appeals">К списку</a></div>'; return; }
+    if (!appeal) { $view.innerHTML = '<div class="panel empty"><b>Апелляция не найдена</b><a href="#/appeals">К списку</a></div>'; return; }
     const ev = await api("/evaluations/" + appeal.evaluation_id);
     const conv = await api("/conversations/" + encodeURIComponent(appeal.conversation_id));
     const c = ev.checklist.data.criteria.find((x) => x.id === appeal.criterion_id);
@@ -428,38 +596,38 @@
     const decided = appeal.status === "decided";
 
     $view.innerHTML = `
-      <p><a href="#/appeals">← Все апелляции</a></p>
-      <h1>Апелляция #${appeal.id}: ${esc(c.title)}</h1>
-      <p class="sub">Диалог <a href="#/c/${encodeURIComponent(conv.id)}">${esc(conv.id)}</a> · оценка #${ev.id} · чек-лист v${ev.checklist.version}</p>
+      <a class="back" href="#/appeals">← Все апелляции</a>
+      <div class="page-head"><div><h1>Апелляция #${appeal.id}: ${esc(c.title)}</h1>
+        <p class="lead">Диалог <a href="#/c/${encodeURIComponent(conv.id)}">${esc(conv.id)}</a> · оценка #${ev.id} · чек-лист v${ev.checklist.version}</p></div></div>
       <div class="card-grid">
         <div>
           <div class="panel">
             <h2>Спорная оценка</h2>
-            <p><span class="badge">${esc(answerLabel(c, r.answer))}</span> <span class="small muted">${TYPE[c.type]}${c.type !== "flag" ? " · вес " + c.weight : ""}</span></p>
+            <div class="row"><span class="chip ${answerClass(c, r.answer)}">${esc(answerLabel(c, r.answer))}</span><span class="small muted">${TYPE[c.type]}${c.type !== "flag" ? " · вес " + c.weight : ""}</span></div>
             <p class="small muted">${esc(c.description)}${c.na_allowed ? `<br>N/A: ${esc(c.na_condition)}` : ""}</p>
             <p><b>Объяснение модели:</b> ${esc(r.explanation)}</p>
-            ${r.evidence.map((e) => `<div class="quote ${e.verified ? "" : "unverified"}">${esc(e.message_id)}: «${esc(e.quote)}»</div>`).join("<br>")}
+            <ul class="evidence">${r.evidence.map((e) => `<li><div class="quote ${e.verified ? "" : "unverified"}"><span class="mono">${esc(e.message_id)}</span>«${esc(e.quote)}»</div></li>`).join("")}</ul>
             <div class="appeal-box"><b>Комментарий апелляции:</b> ${esc(appeal.comment)}</div>
           </div>
           <div class="panel">
             <h2>Фрагмент диалога</h2>
-            ${fragment.length ? fragment.map((m) => `<div class="msg ${esc(m.speaker)}"><div class="id">${esc(m.id)}</div><div><span class="who">${SPEAKER[m.speaker]}</span><span class="ts">${esc(m.timestamp)}</span><div>${esc(m.text)}</div></div></div>`).join("") : '<p class="muted">Модель не указала реплик — смотрите полный диалог.</p>'}
+            ${fragment.length ? fragment.map((m) => `<div class="msg ${esc(m.speaker)}"><div class="id">${esc(m.id)}</div><div><span class="who">${SPEAKER[m.speaker]}</span><span class="ts">${esc(m.timestamp)}</span><div class="text">${esc(m.text)}</div></div></div>`).join("") : '<p class="muted">Модель не указала реплик — смотрите полный диалог.</p>'}
             <a href="#/c/${encodeURIComponent(conv.id)}">Открыть полный диалог →</a>
           </div>
         </div>
         <div class="panel">
           <h2>Решение проверяющего</h2>
           ${decided ? `
-            <p><span class="badge ${appeal.decision === "change" ? "warn" : "ok"}">${appeal.decision === "change" ? "Оценка изменена" : "Оценка подтверждена"}</span></p>
+            <p><span class="chip ${appeal.decision === "change" ? "warn" : "good"}">${appeal.decision === "change" ? "Оценка изменена" : "Оценка подтверждена"}</span></p>
             ${appeal.decision === "change" ? `<p>Новый ответ: <b>${esc(answerLabel(c, appeal.new_answer))}</b></p>` : ""}
             <p><b>Причина:</b> ${esc(appeal.reason)}</p>
-            <p>Исходный итог: <b>${ev.score}</b> → финальный итог: <b>${ev.final.score}</b></p>` : `
+            <p>Итог: <b>${fmt(ev.score)}</b> → <b>${fmt(ev.final.score)}</b></p>` : `
             <div class="row"><label class="chk"><input type="radio" name="decision" value="confirm" checked> Подтвердить оценку</label>
             <label class="chk"><input type="radio" name="decision" value="change"> Изменить оценку</label></div>
-            <p id="new-answer-wrap" hidden>Новый ответ:
-              <select id="new-answer">${answerOptions(c).filter((o) => o !== r.answer).map((o) => `<option value="${o}">${esc(answerLabel(c, o))}</option>`).join("")}</select></p>
-            <p><textarea id="reason" placeholder="Причина решения (обязательно)"></textarea></p>
-            <p>Исходный итог: <b>${ev.score}</b> → после решения: <b id="preview-score">${ev.final.score}</b></p>
+            <p id="new-answer-wrap" hidden><label class="field">Новый ответ
+              <select id="new-answer">${answerOptions(c).filter((o) => o !== r.answer).map((o) => `<option value="${o}">${esc(answerLabel(c, o))}</option>`).join("")}</select></label></p>
+            <p><label class="field">Причина решения (обязательно)<textarea id="reason"></textarea></label></p>
+            <div class="kpi" style="margin-bottom:12px"><div class="label">Итог после решения</div><div class="value"><span id="preview-score">${fmt(ev.final.score)}</span><small> было ${fmt(ev.score)}</small></div></div>
             <button class="btn primary" id="decide-btn">Сохранить решение</button>`}
         </div>
       </div>`;
@@ -469,15 +637,15 @@
     const body = () => ({ decision: decision(), new_answer: decision() === "change" ? document.getElementById("new-answer").value : null, reason: document.getElementById("reason").value });
     const preview = async () => {
       document.getElementById("new-answer-wrap").hidden = decision() !== "change";
-      try { const p = await api(`/appeals/${appeal.id}/preview`, { method: "POST", body: body() }); document.getElementById("preview-score").textContent = p.score ?? "—"; }
-      catch (err) { document.getElementById("preview-score").textContent = "—"; }
+      try { const p = await api(`/appeals/${appeal.id}/preview`, { method: "POST", body: body() }); document.getElementById("preview-score").textContent = fmt(p.score); }
+      catch { document.getElementById("preview-score").textContent = "—"; }
     };
     document.querySelectorAll("input[name=decision]").forEach((i) => i.addEventListener("change", preview));
     document.getElementById("new-answer").addEventListener("change", preview);
     document.getElementById("decide-btn").addEventListener("click", async () => {
       try {
         const res = await api(`/appeals/${appeal.id}/decide`, { method: "POST", body: body() });
-        toast(`Решение сохранено. Итог: ${res.final.score}`);
+        toast(`Решение сохранено. Итог: ${fmt(res.final.score)}`);
         refreshHeader();
         viewAppeals(appeal.id);
       } catch (err) { toast(err.message, true); }
@@ -494,38 +662,42 @@
     function draw() {
       const totalWeight = data.criteria.filter((c) => c.type !== "flag").reduce((a, c) => a + Number(c.weight || 0), 0);
       $view.innerHTML = `
-        <h1>Чек-лист</h1>
-        <p class="sub">Изменения сохраняются как новая версия. Старые оценки остаются привязаны к своей версии; новую версию выберите при запуске оценки.</p>
-        <div class="panel row">
-          <label>Версия <select id="version">${versions.map((v) => `<option value="${v.id}" ${v.id === current.id ? "selected" : ""}>v${v.version} — ${esc(v.comment)} (${esc(v.created_at.slice(0, 16).replace("T", " "))})</option>`).join("")}</select></label>
-          <span class="grow"></span>
-          <span class="small muted">Сумма весов: ${totalWeight}. При N/A вес перераспределяется, максимум всегда 100.</span>
+        <div class="page-head">
+          <div><h1>Чек-лист</h1><p class="lead">Критерии, по которым модель оценивает диалоги. Изменения сохраняются как новая версия: старые оценки остаются привязаны к своей версии, новую выберите при запуске оценки.</p></div>
+          <label class="field">Версия<select id="version">${versions.map((v) => `<option value="${v.id}" ${v.id === current.id ? "selected" : ""}>v${v.version} — ${esc(v.comment)} (${esc(v.created_at.slice(0, 16).replace("T", " "))})</option>`).join("")}</select></label>
         </div>
+        <details class="help"><summary>Как устроен расчёт</summary><ul>
+          <li><b>Да / Нет</b>: «Да» даёт полный вес, «Нет» — ноль.</li>
+          <li><b>Шкала</b>: баллы пропорциональны весу, верхняя ступень даёт полный вес.</li>
+          <li><b>N/A</b>: критерий исключается, его вес делится между остальными — максимум всегда 100.</li>
+          <li><b>Грубая ошибка</b>: отмечается отдельно и в баллы не входит.</li>
+          <li>Сейчас сумма весов: <b>${totalWeight}</b>. Она может быть любой — итог всё равно приводится к 100.</li>
+        </ul></details>
         <div class="editor">
           ${data.criteria.map((c, i) => `
             <div class="crit" data-i="${i}">
-              <div class="row"><b class="grow">${i + 1}. <input type="text" data-f="title" value="${esc(c.title)}" style="width:70%"></b>
-                <button class="btn small" data-act="up" ${i === 0 ? "disabled" : ""}>↑</button>
-                <button class="btn small" data-act="down" ${i === data.criteria.length - 1 ? "disabled" : ""}>↓</button>
-                <button class="btn small danger" data-act="del">Удалить</button></div>
+              <div class="row"><span class="chip">${i + 1}</span><input type="text" data-f="title" value="${esc(c.title)}" class="grow" aria-label="Название критерия">
+                <button class="btn sm" data-act="up" ${i === 0 ? "disabled" : ""} aria-label="Выше">↑</button>
+                <button class="btn sm" data-act="down" ${i === data.criteria.length - 1 ? "disabled" : ""} aria-label="Ниже">↓</button>
+                <button class="btn sm danger" data-act="del">Удалить</button></div>
               <div class="grid">
-                <label>ID<input type="text" data-f="id" value="${esc(c.id)}"></label>
-                <label>Раздел<select data-f="section">${sectionOpts(c.section)}</select></label>
-                <label>Тип ответа<select data-f="type">${Object.entries(TYPE).map(([k, v]) => `<option value="${k}" ${c.type === k ? "selected" : ""}>${v}</option>`).join("")}</select></label>
-                <label>Вес<input type="number" min="0" step="1" data-f="weight" value="${esc(c.weight)}" ${c.type === "flag" ? "disabled" : ""}></label>
-                <label>N/A<span><input type="checkbox" data-f="na_allowed" ${c.na_allowed ? "checked" : ""}> разрешён</span></label>
+                <label class="field">ID<input type="text" data-f="id" value="${esc(c.id)}"></label>
+                <label class="field">Раздел<select data-f="section">${sectionOpts(c.section)}</select></label>
+                <label class="field">Тип ответа<select data-f="type">${Object.entries(TYPE).map(([k, v]) => `<option value="${k}" ${c.type === k ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+                <label class="field">Вес<input type="number" min="0" step="1" data-f="weight" value="${esc(c.weight)}" ${c.type === "flag" ? "disabled" : ""}></label>
+                <label class="field">N/A<span class="chk"><input type="checkbox" data-f="na_allowed" ${c.na_allowed ? "checked" : ""}> разрешён</span></label>
               </div>
-              <label class="small muted">Формулировка (что считать «Да» / как оценивать)<textarea data-f="description">${esc(c.description)}</textarea></label>
-              ${c.na_allowed ? `<label class="small muted">Условие N/A<textarea data-f="na_condition">${esc(c.na_condition)}</textarea></label>` : ""}
-              ${c.type === "scale" ? `<div class="small muted" style="margin-top:6px">Шкала (верхняя ступень даёт полный вес):</div>
-                ${(c.scale || []).map((s, j) => `<div class="scale-row"><input type="number" data-s="${j}" data-sf="value" value="${esc(s.value)}"><input type="text" data-s="${j}" data-sf="label" value="${esc(s.label)}"><button class="btn small" data-act="sdel" data-s="${j}">×</button></div>`).join("")}
-                <button class="btn small" data-act="sadd" style="margin-top:4px">+ ступень</button>` : ""}
+              <label class="field">Формулировка — что считать «Да» / как оценивать<textarea data-f="description">${esc(c.description)}</textarea></label>
+              ${c.na_allowed ? `<label class="field" style="margin-top:8px">Когда критерий неприменим (N/A)<textarea data-f="na_condition">${esc(c.na_condition)}</textarea></label>` : ""}
+              ${c.type === "scale" ? `<div class="small muted" style="margin-top:8px">Ступени шкалы (верхняя даёт полный вес):</div>
+                ${(c.scale || []).map((s, j) => `<div class="scale-row"><input type="number" data-s="${j}" data-sf="value" value="${esc(s.value)}" aria-label="Значение"><input type="text" data-s="${j}" data-sf="label" value="${esc(s.label)}" aria-label="Описание ступени"><button class="btn sm" data-act="sdel" data-s="${j}" aria-label="Удалить ступень">×</button></div>`).join("")}
+                <button class="btn sm ghost" data-act="sadd" style="margin-top:4px">+ ступень</button>` : ""}
             </div>`).join("")}
         </div>
         <div class="panel row">
           <button class="btn" id="add">+ Добавить критерий</button>
           <span class="grow"></span>
-          <input type="text" id="comment" placeholder="Комментарий к версии (что изменено)" size="40">
+          <input type="text" id="comment" placeholder="Что изменено (комментарий к версии)" size="36">
           <button class="btn primary" id="save">Сохранить новую версию</button>
         </div>`;
 
@@ -544,6 +716,7 @@
             if (c.type !== "flag" && !c.weight) c.weight = 10;
             draw();
           }
+          if (f === "weight") draw();
         }));
         box.querySelectorAll("[data-sf]").forEach((inp) => inp.addEventListener("change", () => {
           const s = c.scale[Number(inp.dataset.s)];
@@ -581,12 +754,14 @@
   // ---------- роутер ----------
   async function render() {
     stopPolling();
+    $tip.hidden = true;
     const hash = location.hash || "#/";
     const parts = hash.slice(2).split("/").map(decodeURIComponent);
-    document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active",
-      (parts[0] === "" || parts[0] === "c") ? a.dataset.nav === "list" : a.dataset.nav === parts[0]));
+    const section = parts[0] === "" || parts[0] === "c" ? "list" : parts[0];
+    document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === section));
     try {
       if (parts[0] === "c" && parts[1]) await viewCard(parts[1]);
+      else if (parts[0] === "analytics") await viewAnalytics();
       else if (parts[0] === "checklist") await viewChecklist(parts[1] ? Number(parts[1]) : null);
       else if (parts[0] === "appeals") await viewAppeals(parts[1] ? Number(parts[1]) : null);
       else await viewList();
@@ -595,7 +770,7 @@
     }
   }
 
-  window.addEventListener("hashchange", render);
+  window.addEventListener("hashchange", () => { render(); window.scrollTo(0, 0); });
   refreshHeader();
   render();
 })();

@@ -166,3 +166,21 @@ def test_quote_matching_tolerates_whitespace_and_ellipsis():
     assert evaluator.quote_in_message("меня зовут  Айгерим", text)
     assert evaluator.quote_in_message("Здравствуйте! … специалист поддержки", text)
     assert not evaluator.quote_in_message("Меня зовут Ольга", text)
+
+
+def test_analytics_uses_final_scores(client, monkeypatch):
+    client.post("/api/dataset/import", json={"group_id": "DEMO", "payload": SAMPLES})
+    use_fake(monkeypatch, [good_reply()])
+    eid = client.post("/api/evaluations", json={"conversation_id": "demo-ru-001"}).json()["id"]
+    wait_eval(client, eid)
+    a = client.post("/api/appeals", json={"evaluation_id": eid, "criterion_id": "c4", "comment": "x"}).json()
+    client.post(f"/api/appeals/{a['id']}/decide", json={"decision": "change", "new_answer": "15", "reason": "y"})
+    data = client.get("/api/analytics?group_id=DEMO").json()
+    assert data["total"] == 5 and data["statuses"]["done"] == 1 and data["statuses"]["none"] == 4
+    assert data["avg_score"] == 94.12
+    assert data["appeals"] == {"total": 1, "open": 0, "confirmed": 0, "changed": 1}
+    c4 = next(c for c in data["criteria"] if c["id"] == "c4")
+    assert c4["fulfilment"] == 75.0
+    c2 = next(c for c in data["criteria"] if c["id"] == "c2")
+    assert c2["na"] == 1 and c2["fulfilment"] is None
+    assert data["groups"] == ["DEMO"]

@@ -431,6 +431,114 @@ def appeal_decide(appeal_id: int, body: DecisionIn):
         return _evaluation(conn, ev["id"])
 
 
+# ---------- аналитика ----------
+
+def _avg(values):
+    return round(sum(values) / len(values), 2) if values else None
+
+
+@app.get("/api/analytics")
+def analytics(group_id: str | None = None):
+    """Сводка по последней оценке каждого диалога, с учётом решений по апелляциям."""
+    with connect() as conn:
+        convs = [dict(r) for r in conn.execute("SELECT id, group_id, channel, language FROM conversations ORDER BY id")]
+        if group_id:
+            convs = [c for c in convs if c["group_id"] == group_id]
+        latest = {
+            r["conversation_id"]: r["id"]
+            for r in conn.execute("SELECT conversation_id, MAX(id) AS id FROM evaluations GROUP BY conversation_id")
+        }
+        checklists: dict = {}
+        statuses = {"none": 0, "queued": 0, "running": 0, "done": 0, "needs_review": 0, "failed": 0}
+        scored, by_lang, by_channel, criteria, critical, rows = [], {}, {}, {}, [], []
+        cost = tokens_in = tokens_out = 0.0
+        evaluations_total = 0
+        for c in convs:
+            eid = latest.get(c["id"])
+            if not eid:
+                statuses["none"] += 1
+                continue
+            ev = _evaluation(conn, eid)
+            statuses[ev["status"]] = statuses.get(ev["status"], 0) + 1
+            if not ev["results"]:
+                continue
+            evaluations_total += 1
+            cost += ev["cost_usd"] or 0
+            tokens_in += ev["tokens_in"] or 0
+            tokens_out += ev["tokens_out"] or 0
+            if ev["checklist_id"] not in checklists:
+                checklists[ev["checklist_id"]] = _checklist(conn, ev["checklist_id"])["data"]
+            cl = checklists[ev["checklist_id"]]
+            final = ev["final"]
+            score = float(final["score"]) if final["score"] is not None else None
+            if score is not None:
+                scored.append(score)
+                by_lang.setdefault(c["language"], []).append(score)
+                by_channel.setdefault(c["channel"], []).append(score)
+            if final["critical"]:
+                crit_c = next((x for x in cl["criteria"] if x["type"] == "flag" and final["answers"].get(x["id"]) == "yes"), None)
+                critical.append({
+                    "conversation_id": c["id"], "language": c["language"], "channel": c["channel"], "score": final["score"],
+                    "reason": ev["results"].get(crit_c["id"], {}).get("explanation", "") if crit_c else "",
+                    "status": ev["status"],
+                })
+            rows.append({"conversation_id": c["id"], "language": c["language"], "channel": c["channel"], "score": final["score"], "critical": final["critical"], "status": ev["status"]})
+            for crit in cl["criteria"]:
+                answer = final["answers"].get(crit["id"])
+                if answer is None:
+                    continue
+                s = criteria.setdefault(crit["id"], {"id": crit["id"], "title": crit["title"], "type": crit["type"], "weight": crit["weight"], "evaluated": 0, "na": 0, "fulfilment": [], "violations": 0})
+                s["evaluated"] += 1
+                if answer == "na":
+                    s["na"] += 1
+                elif crit["type"] == "flag":
+                    s["violations"] += answer == "yes"
+                else:
+                    item = final["criteria"][crit["id"]]
+                    s["fulfilment"].append(float(item["points"]) / float(item["weight"]) * 100)
+        appeals = [dict(a) for a in conn.execute("SELECT a.status, a.decision, e.conversation_id FROM appeals a JOIN evaluations e ON e.id=a.evaluation_id")]
+        all_groups = [r[0] for r in conn.execute("SELECT DISTINCT group_id FROM conversations ORDER BY 1")]
+    if group_id:
+        ids = {c["id"] for c in convs}
+        appeals = [a for a in appeals if a["conversation_id"] in ids]
+    buckets = [("0–19", 0, 20), ("20–39", 20, 40), ("40–59", 40, 60), ("60–79", 60, 80), ("80–99", 80, 100), ("100", 100, 101)]
+    crit_out = []
+    for s in criteria.values():
+        crit_out.append({
+            "id": s["id"], "title": s["title"], "type": s["type"], "weight": s["weight"], "evaluated": s["evaluated"], "na": s["na"],
+            "fulfilment": _avg(s["fulfilment"]), "violations": s["violations"],
+        })
+    scored_sorted = sorted(scored)
+    median = None
+    if scored_sorted:
+        mid = len(scored_sorted) // 2
+        median = scored_sorted[mid] if len(scored_sorted) % 2 else round((scored_sorted[mid - 1] + scored_sorted[mid]) / 2, 2)
+    return {
+        "group_id": group_id,
+        "groups": all_groups,
+        "total": len(convs),
+        "statuses": statuses,
+        "avg_score": _avg(scored),
+        "median_score": median,
+        "distribution": [{"label": lbl, "count": sum(lo <= s < hi for s in scored)} for lbl, lo, hi in buckets],
+        "by_language": [{"key": k, "count": len(v), "avg": _avg(v)} for k, v in sorted(by_lang.items())],
+        "by_channel": [{"key": k, "count": len(v), "avg": _avg(v)} for k, v in sorted(by_channel.items())],
+        "criteria": crit_out,
+        "critical": critical,
+        "lowest": sorted([r for r in rows if r["score"] is not None], key=lambda r: float(r["score"]))[:10],
+        "appeals": {
+            "total": len(appeals),
+            "open": sum(a["status"] == "open" for a in appeals),
+            "confirmed": sum(a["decision"] == "confirm" for a in appeals),
+            "changed": sum(a["decision"] == "change" for a in appeals),
+        },
+        "cost": {
+            "total_usd": round(cost, 4), "per_evaluation_usd": round(cost / evaluations_total, 5) if evaluations_total else None,
+            "tokens_in": int(tokens_in), "tokens_out": int(tokens_out), "evaluations": evaluations_total,
+        },
+    }
+
+
 # ---------- экспорт ----------
 
 @app.get("/api/export")

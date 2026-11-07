@@ -324,3 +324,14 @@ def test_call_falls_back_to_text_when_audio_fails(client, monkeypatch):
 def test_gemini_audio_cost():
     # 1000 текстовых + 3000 аудио-токенов на входе, 500 на выходе для gemini-2.5-flash
     assert llm.cost_usd("gemini", "gemini-2.5-flash", 4000, 500, 3000) == round(1000 / 1e6 * 0.30 + 3000 / 1e6 * 1.00 + 500 / 1e6 * 2.50, 6)
+
+
+def test_kazakh_explanation_triggers_repair(client, monkeypatch):
+    client.post("/api/dataset/import", json={"group_id": "DEMO", "payload": SAMPLES})
+    kz = good_reply()
+    kz["criteria"][0]["explanation"] = "Оператор амандасып, өзін таныстырды."
+    fake = use_fake(monkeypatch, [kz, good_reply()])
+    eid = client.post("/api/evaluations", json={"conversation_id": "demo-ru-001"}).json()["id"]
+    ev = wait_eval(client, eid)
+    assert fake.calls == 2 and ev["status"] == "done"
+    assert ev["results"]["c1"]["explanation"] == "ok"

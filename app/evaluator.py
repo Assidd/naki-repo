@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from . import llm
 from .scoring import allowed_answers, compute
 
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v5"
 
 RESPONSE_SCHEMA = {
     "type": "object",
@@ -27,7 +27,7 @@ RESPONSE_SCHEMA = {
                 "properties": {
                     "criterion_id": {"type": "string"},
                     "answer": {"type": "string"},
-                    "explanation": {"type": "string"},
+                    "explanation": {"type": "string", "description": "Пояснение строго на русском языке, 1–2 предложения"},
                     "evidence": {
                         "type": "array",
                         "items": {
@@ -65,7 +65,7 @@ SYSTEM_PROMPT = """Ты — специалист контроля качеств
    - Для flag="yes" обязательно процитируй реплику с нарушением.
    - Для "na" объясни, какое условие неприменимости выполнено; evidence может быть пустым.
    - Если checked_range не нужен — null.
-5. explanation — 1–2 коротких предложения на русском языке: что сделал или не сделал оператор и почему такой ответ.
+5. explanation — 1–2 коротких предложения: что сделал или не сделал оператор и почему такой ответ. Пиши explanation ВСЕГДА на русском языке, даже если диалог на казахском или английском; цитаты в evidence при этом копируй дословно на языке оригинала.
 6. Не выдумывай факты о продуктах, тарифах и сроках компании. Если правильность консультации по существу проверить нельзя, оцени полноту и логичность ответа и прямо скажи в объяснении, что факт не проверен.
 7. В звонках (voice call) транскрипт получен автоматическим распознаванием речи: ошибки распознавания и особенности устной речи — не ошибка оператора.
 8. Верни ответ по каждому критерию из списка, ровно один раз."""
@@ -117,6 +117,21 @@ def _range_ok(rng: str | None, ids: set) -> bool:
     return bool(found) and all(f in ids for f in found)
 
 
+KZ_LETTERS = set("әғқңөұүһіӘҒҚҢӨҰҮҺІ")
+
+
+def non_russian(results: dict) -> list[str]:
+    """Критерии, где объяснение написано не по-русски (казахские буквы или нет кириллицы)."""
+    out = []
+    for cid, r in results.items():
+        text = r.get("explanation", "")
+        latin = sum("a" <= ch.lower() <= "z" for ch in text)
+        cyrillic = any("а" <= ch.lower() <= "я" for ch in text)
+        if any(ch in KZ_LETTERS for ch in text) or (not cyrillic and latin >= 15):
+            out.append(f"{cid}: объяснение должно быть на русском языке")
+    return out
+
+
 def build_user_prompt(conv: dict, checklist: dict) -> str:
     lines = []
     for c in checklist["criteria"]:
@@ -137,6 +152,8 @@ def build_user_prompt(conv: dict, checklist: dict) -> str:
         f"Канал: {conv['channel']}. Язык диалога: {conv['language']}.\n\n"
         f"ЧЕК-ЛИСТ:\n" + "\n".join(lines) + (f"\nПримечание: {notes}" if notes else "") +
         f"\n\nДИАЛОГ:\n{transcript}"
+        "\n\nВАЖНО: все поля explanation пиши на русском языке, даже если диалог на казахском или английском. "
+        "Цитаты в evidence — дословно на языке оригинала."
     )
 
 
@@ -283,11 +300,14 @@ async def evaluate(conv: dict, checklist: dict, model: str | None = None,
                 tokens_out += reply.tokens_out
                 audio_tokens += reply.audio_tokens
                 results, structural, ev_issues = check_reply(reply.data, conv, checklist)
+                lang = non_russian(results)
                 if not structural:
-                    best = (results, ev_issues, reply.model, reply.data)
-                    if not ev_issues:
+                    # из попыток берём ту, где меньше проблем; язык объяснений — мягкое требование
+                    if best is None or len(ev_issues) + len(lang) < best[4]:
+                        best = (results, ev_issues, reply.model, reply.data, len(ev_issues) + len(lang))
+                    if not ev_issues and not lang:
                         break
-                feedback = structural + ev_issues
+                feedback = structural + ev_issues + lang
                 prompt = (
                     user_prompt
                     + "\n\nПРЕДЫДУЩИЙ ОТВЕТ ОТКЛОНЁН ПРОВЕРКОЙ. Исправь ошибки и верни полный ответ заново:\n- "
@@ -299,7 +319,7 @@ async def evaluate(conv: dict, checklist: dict, model: str | None = None,
         except llm.LLMError as exc:
             errors.append(str(exc) + (" (анализ звука)" if sound else ""))
             continue
-        results, ev_issues, used_model, data = best
+        results, ev_issues, used_model, data, _ = best
         calc = compute(checklist, {cid: r["answer"] for cid, r in results.items()})
         for cid, r in results.items():
             r.update(calc["criteria"][cid])

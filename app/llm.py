@@ -54,7 +54,7 @@ KNOWN_PRICES = {
 # Входной звук у Gemini дороже текста (USD за 1 млн аудио-токенов, ~32 токена на секунду записи)
 AUDIO_PRICES = {"gemini-3.8-flash": 0.75, "gemini-2.5-flash-lite": 0.30, "gemini-2.5-flash": 1.00, "gemini-2.5-pro": 1.25, "gemini-2.0-flash": 0.70}
 
-DEFAULT_OPENAI_MODELS = "gpt-4o-mini,gpt-6-luna,gpt-4.1-mini,gpt-4.1,gpt-4o"
+DEFAULT_OPENAI_MODELS = "gpt-6-luna,gpt-4o-mini,gpt-4.1-mini,gpt-4.1,gpt-4o"
 
 
 def cost_usd(provider: str, model: str, tokens_in: int, tokens_out: int, audio_tokens: int = 0) -> float | None:
@@ -99,7 +99,7 @@ class OpenAIProvider:
 
     def __init__(self, model: str | None = None):
         self.key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-6-luna").strip()
 
     @property
     def available(self) -> bool:

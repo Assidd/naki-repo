@@ -144,14 +144,23 @@
   async function refreshHeader() {
     try {
       const s = await api("/status");
-      document.getElementById("model-status").innerHTML = s.llm.configured
-        ? "Модель оценки по умолчанию<br>" + s.llm.providers.map((p, i) => `<b>${esc(p.model)}</b>${i ? " (запасная)" : ""}`).join("<br>")
-        : '<span class="chip bad">Модель не настроена</span><br>Укажите OPENAI_API_KEY в .env';
+      state.models = s.llm.models || [];
+      if (state.model && !state.models.some((m) => m.id === state.model)) state.model = "";
+      const box = document.getElementById("model-status");
+      if (!s.llm.configured) {
+        box.innerHTML = '<span class="chip bad">Модель не настроена</span><br>Укажите OPENAI_API_KEY в .env';
+      } else if (!box.querySelector("#sidebar-model")) {
+        // Общий выбор модели для всех новых оценок; синхронизирован с выбором на страницах
+        const fallback = s.llm.providers.slice(1).map((p) => esc(p.model)).join(", ");
+        box.innerHTML = `<label for="sidebar-model">Модель оценки</label>${modelOptions("sidebar-model")}
+          ${fallback ? `<div>Запасная: <b>${fallback}</b></div>` : ""}`;
+        bindModelSelect("sidebar-model");
+      } else {
+        box.querySelector("#sidebar-model").value = state.model;
+      }
       document.getElementById("env").innerHTML = `
         <span class="chip ${s.organizer_configured ? "good" : ""}" data-tip="${s.organizer_configured ? "Источник данных организаторов подключён" : "Ссылка на API организаторов не задана"}">${icon(s.organizer_configured ? "check" : "info")} API организаторов</span>
         <span class="chip ${s.llm.configured ? "good" : "bad"}">${icon(s.llm.configured ? "check" : "x")} Модель ИИ</span>`;
-      state.models = s.llm.models || [];
-      if (state.model && !state.models.some((m) => m.id === state.model)) state.model = "";
       const pill = document.getElementById("appeal-count");
       pill.hidden = !s.open_appeals;
       pill.textContent = s.open_appeals;
@@ -160,17 +169,28 @@
   }
 
   // ---------- выбор модели ----------
-  function modelSelect(id) {
-    if (!state.models.length) return "";
+  function modelOptions(id) {
     const price = (m) => (m.price ? ` · $${m.price.input_per_1m} / $${m.price.output_per_1m} за 1M` : "");
     const def = state.models.find((m) => m.default) || state.models[0];
-    return `<label class="field" data-tip="Модель для новых оценок. Цена ориентировочная: вход / выход за 1 млн токенов">Модель
-      <select id="${id}"><option value="">По умолчанию (${esc(def.model)})</option>
-      ${state.models.map((m) => `<option value="${esc(m.id)}" ${state.model === m.id ? "selected" : ""}>${esc(m.model)}${m.provider !== "openai" ? " (" + esc(m.provider) + ")" : ""}${price(m)}</option>`).join("")}</select></label>`;
+    return `<select id="${id}" class="model-select"><option value="">По умолчанию (${esc(def.model)})</option>
+      ${state.models.map((m) => `<option value="${esc(m.id)}" ${state.model === m.id ? "selected" : ""}>${esc(m.model)}${m.provider !== "openai" ? " (" + esc(m.provider) + ")" : ""}${price(m)}</option>`).join("")}</select>`;
+  }
+  function modelSelect(id) {
+    if (!state.models.length) return "";
+    return `<label class="field" data-tip="Модель для новых оценок (то же, что в левой панели). Цена ориентировочная: вход / выход за 1 млн токенов">Модель
+      ${modelOptions(id)}</label>`;
   }
   function bindModelSelect(id) {
     const el = document.getElementById(id);
-    if (el) el.addEventListener("change", () => { state.model = el.value; store.set("model", el.value); });
+    if (!el) return;
+    el.addEventListener("change", () => {
+      state.model = el.value;
+      store.set("model", el.value);
+      // Все переключатели модели на экране показывают одно значение
+      document.querySelectorAll(".model-select").forEach((s) => { if (s !== el) s.value = el.value; });
+      const m = state.models.find((x) => x.id === el.value);
+      toast("Новые оценки будут выполняться моделью " + (m ? m.model : "по умолчанию"));
+    });
   }
 
   // ---------- сдача результатов ----------

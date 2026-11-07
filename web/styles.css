@@ -66,6 +66,11 @@ nav a.active svg.i { color: var(--accent); }
 .model-status { margin-top: auto; font-size: 12px; color: var(--nav-muted); padding: 12px 10px 0; border-top: 1px solid rgba(255, 255, 255, .1); line-height: 1.5; }
 .model-status b { color: var(--nav-ink); font-weight: 600; }
 .model-status .chip { background: rgba(255, 255, 255, .08); color: #ffb4ad; }
+.model-status label { display: block; margin-bottom: 6px; }
+.model-status select { width: 100%; background: var(--nav-bg-2); color: var(--nav-ink); border: 1px solid rgba(255, 255, 255, .18); border-radius: 6px; padding: 6px 8px; min-height: 34px; font-size: 13px; }
+.model-status select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(195, 230, 167, .25); outline: none; }
+.model-status select option { background: var(--surface); color: var(--ink); }
+.model-status div { margin-top: 6px; }
 
 .content { min-width: 0; display: flex; flex-direction: column; }
 .topbar { background: var(--surface); border-bottom: 1px solid var(--line); padding: 12px 32px; display: flex; align-items: center; gap: 16px; min-height: 56px; position: sticky; top: 0; z-index: 5; }

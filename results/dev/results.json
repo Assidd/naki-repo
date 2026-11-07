@@ -3,7 +3,7 @@
   "team_name": "naki",
   "model": {
     "mode": "external_api",
-    "name": "gemini-3.8-flash +audio, gpt-4o-mini-2024-07-18"
+    "name": "gemini-3.8-flash, gpt-4o-mini-2024-07-18"
   },
   "results": [
     {

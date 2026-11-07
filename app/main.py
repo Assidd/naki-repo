@@ -595,7 +595,7 @@ def _results_payload(group_id: str, use_appeals: bool) -> tuple[dict, list[str]]
             ev = _evaluation(conn, row["id"]) if row else None
             checklist = _checklist(conn, ev["checklist_id"])["data"] if ev else None
             if ev and ev.get("model"):
-                models.append(ev["model"].split(" (")[0])
+                models.append(ev["model"].split(" (")[0].replace(" +audio", ""))
             records.append(results_mod.build_record(cid, ev, checklist, use_appeals))
     payload = {
         "schema_version": "1.0",

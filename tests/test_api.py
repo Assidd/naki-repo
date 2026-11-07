@@ -233,3 +233,17 @@ def test_model_selection(client, monkeypatch):
     r = client.post("/api/evaluations", json={"conversation_id": "demo-ru-001", "model": "openai:unknown"})
     assert r.status_code == 400
     assert llm.cost_usd("openai", "gpt-4.1-2025-04-14", 1_000_000, 0) == 2.0
+
+
+def test_delete_dataset(client, monkeypatch):
+    client.post("/api/dataset/import", json={"group_id": "DEMO", "payload": SAMPLES})
+    client.post("/api/dataset/import", json={"group_id": "KEEP", "payload": {"records": [{"conversation_id": "k1", "language": "RU", "channel": "agent chat", "transcript": [{"speaker": "client", "text": "Привет"}]}]}})
+    use_fake(monkeypatch, [good_reply()])
+    eid = client.post("/api/evaluations", json={"conversation_id": "demo-ru-001"}).json()["id"]
+    wait_eval(client, eid)
+    client.post("/api/appeals", json={"evaluation_id": eid, "criterion_id": "c4", "comment": "x"})
+    r = client.delete("/api/datasets/DEMO").json()
+    assert r == {"group_id": "DEMO", "conversations": 5, "evaluations": 1}
+    assert [c["id"] for c in client.get("/api/conversations").json()] == ["k1"]
+    assert client.get("/api/appeals").json() == []
+    assert client.delete("/api/datasets/DEMO").status_code == 404

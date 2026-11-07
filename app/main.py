@@ -194,6 +194,25 @@ async def dataset_upload(request: Request, filename: str, group_id: str = "MANUA
     return {**result, "filename": filename, "ids": [r["conversation_id"] for r in records][:50]}
 
 
+@app.delete("/api/datasets/{group_id}")
+def dataset_delete(group_id: str):
+    """Удаляет набор целиком: диалоги, их оценки и апелляции. Чек-листы не трогает."""
+    with connect() as conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM conversations WHERE group_id=?", (group_id,))]
+        if not ids:
+            raise HTTPException(404, f"Набора «{group_id}» нет")
+        marks = ",".join("?" * len(ids))
+        busy = conn.execute(f"SELECT COUNT(*) FROM evaluations WHERE conversation_id IN ({marks}) AND status IN ('queued','running')", ids).fetchone()[0]
+        if busy:
+            raise HTTPException(409, "В наборе идут оценки — дождитесь их окончания")
+        conn.execute(f"DELETE FROM appeals WHERE evaluation_id IN (SELECT id FROM evaluations WHERE conversation_id IN ({marks}))", ids)
+        evals = conn.execute(f"DELETE FROM evaluations WHERE conversation_id IN ({marks})", ids).rowcount
+        conn.execute(f"DELETE FROM conversations WHERE id IN ({marks})", ids)
+    for cid in ids:
+        _audio_cache.pop(cid, None)
+    return {"group_id": group_id, "conversations": len(ids), "evaluations": evals}
+
+
 @app.get("/api/dataset/template.csv")
 def dataset_template():
     return Response(CSV_TEMPLATE.encode("utf-8-sig"), media_type="text/csv; charset=utf-8",

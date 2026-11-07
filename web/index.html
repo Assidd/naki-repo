@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CQA · Контроль качества диалогов</title>
+  <title>Контроль качества диалогов · Freedom Broker</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,18 +11,24 @@
   <div id="cqa-root" class="cqa">
     <aside class="sidebar">
       <div class="brand">
-        <span class="logo" aria-hidden="true">F</span>
-        <div><b>CQA</b><small>Контроль качества диалогов</small></div>
+        <div class="wordmark">FREEDOM <span>BROKER</span></div>
+        <small>Контроль качества обслуживания</small>
       </div>
-      <nav aria-label="Разделы">
-        <a href="#/" data-nav="list"><span class="ico" aria-hidden="true">☰</span><span><b>Диалоги</b><small>Загрузка и оценка</small></span></a>
-        <a href="#/analytics" data-nav="analytics"><span class="ico" aria-hidden="true">▤</span><span><b>Аналитика</b><small>Сводка по качеству</small></span></a>
-        <a href="#/appeals" data-nav="appeals"><span class="ico" aria-hidden="true">⚖</span><span><b>Апелляции</b><small>Спорные оценки</small></span><span id="appeal-count" class="count" hidden></span></a>
-        <a href="#/checklist" data-nav="checklist"><span class="ico" aria-hidden="true">✓</span><span><b>Чек-лист</b><small>Критерии и веса</small></span></a>
-      </nav>
+      <div class="nav-label">Разделы</div>
+      <nav aria-label="Разделы" id="nav"></nav>
       <div id="model-status" class="model-status"></div>
     </aside>
-    <main id="view"></main>
+    <div class="content">
+      <header class="topbar">
+        <div class="crumbs" id="crumbs"></div>
+        <div class="env" id="env"></div>
+      </header>
+      <main id="view"></main>
+      <footer class="footer">
+        <span>Freedom Broker · Conversation Quality Analytics</span>
+        <span>Оценки формирует ИИ по утверждённому чек-листу; итог рассчитывает сервер</span>
+      </footer>
+    </div>
     <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
     <div id="toast" class="toast" role="status" hidden></div>
   </div>

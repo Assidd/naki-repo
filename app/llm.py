@@ -38,6 +38,7 @@ def _price(name: str) -> float:
 # Ориентировочные цены USD за 1 млн токенов (вход, выход). Сверяйте с прайсом провайдера;
 # для модели по умолчанию цену можно переопределить в .env (*_PRICE_INPUT_PER_1M / *_PRICE_OUTPUT_PER_1M).
 KNOWN_PRICES = {
+    "gpt-6-luna": (0.10, 0.50),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
     "gpt-4.1-nano": (0.10, 0.40),
@@ -53,7 +54,7 @@ KNOWN_PRICES = {
 # Входной звук у Gemini дороже текста (USD за 1 млн аудио-токенов, ~32 токена на секунду записи)
 AUDIO_PRICES = {"gemini-3.8-flash": 0.75, "gemini-2.5-flash-lite": 0.30, "gemini-2.5-flash": 1.00, "gemini-2.5-pro": 1.25, "gemini-2.0-flash": 0.70}
 
-DEFAULT_OPENAI_MODELS = "gpt-4o-mini,gpt-4.1-mini,gpt-4.1,gpt-4o"
+DEFAULT_OPENAI_MODELS = "gpt-4o-mini,gpt-6-luna,gpt-4.1-mini,gpt-4.1,gpt-4o"
 
 
 def cost_usd(provider: str, model: str, tokens_in: int, tokens_out: int, audio_tokens: int = 0) -> float | None:

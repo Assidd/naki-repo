@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass
 
 import httpx
+# Импорт на уровне модуля: тяжёлый импорт внутри обработчика блокировал сервер на первом вызове.
+from openai import AsyncOpenAI, BadRequestError, OpenAIError
 
 
 class LLMError(RuntimeError):
@@ -37,6 +39,23 @@ def cost_usd(provider: str, tokens_in: int, tokens_out: int) -> float | None:
     return round(tokens_in / 1e6 * p_in + tokens_out / 1e6 * p_out, 6)
 
 
+_clients: dict = {}
+
+
+def _openai_client(key: str) -> AsyncOpenAI:
+    # Создание клиента (SSL-контекст) занимает время и блокирует сервер — держим один на ключ.
+    if key not in _clients:
+        _clients[key] = AsyncOpenAI(api_key=key, timeout=120, max_retries=1)
+    return _clients[key]
+
+
+def warm_up() -> None:
+    """Создаёт клиент заранее, при старте сервера, а не во время первой оценки."""
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if key:
+        _openai_client(key)
+
+
 class OpenAIProvider:
     name = "openai"
 
@@ -49,9 +68,7 @@ class OpenAIProvider:
         return bool(self.key)
 
     async def complete(self, system: str, user: str, schema: dict) -> LLMReply:
-        from openai import AsyncOpenAI, BadRequestError, OpenAIError
-
-        client = AsyncOpenAI(api_key=self.key, timeout=120, max_retries=1)
+        client = _openai_client(self.key)
         kwargs = dict(
             model=self.model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],

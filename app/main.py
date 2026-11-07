@@ -23,6 +23,7 @@ from .scoring import ChecklistError, allowed_answers, compute, validate_checklis
 @asynccontextmanager
 async def lifespan(_app):
     init_db(DEFAULT_CHECKLIST)
+    llm.warm_up()
     yield
 
 

@@ -519,6 +519,8 @@
     const ev = eid ? await api("/evaluations/" + eid) : null;
     const isCall = conv.channel === "voice call";
     const offsets = isCall ? audioOffsets(conv.transcript) : {};
+    const asr = {};
+    ((ev && ev.speech && ev.speech.asr_corrections) || []).forEach((c) => (asr[c.message_id] = asr[c.message_id] || []).push(c));
 
     $view.innerHTML = `
       <a class="back" href="#/">${icon("back")} Все диалоги</a>
@@ -547,7 +549,7 @@
           ${conv.transcript.map((m) => `
             <div class="msg ${esc(m.speaker)}" id="msg-${esc(m.id)}" data-offset="${offsets[m.id] ?? ""}">
               <div class="id">${esc(m.id)}</div>
-              <div><span class="who">${SPEAKER[m.speaker] || esc(m.speaker)}</span><span class="ts">${esc(isCall ? m.timestamp.slice(11, 19) : m.timestamp)}</span><div class="text">${esc(m.text)}</div></div>
+              <div><span class="who">${SPEAKER[m.speaker] || esc(m.speaker)}</span><span class="ts">${esc(isCall ? m.timestamp.slice(11, 19) : m.timestamp)}</span><div class="text">${esc(m.text)}</div>${(asr[m.id] || []).map((c) => `<div class="asr" data-tip="По записи звонка распознавание здесь, вероятно, ошиблось">${icon("info")} Вероятно сказано: «${esc(c.likely)}»${c.heard ? ` <span class="muted">(в транскрипте: «${esc(c.heard)}»)</span>` : ""}</div>`).join("")}</div>
             </div>`).join("")}
         </section>
       </div>`;
@@ -615,6 +617,7 @@
         ${ev.status === "needs_review" ? `<div class="banner warn">${icon("alert")}<div><b>Нужна проверка человеком.</b> Часть доказательств модели не нашлась в тексте диалога. Баллы показаны, но проверьте отмеченные критерии.<ul>${ev.issues.map((i) => `<li>${esc(i)}</li>`).join("")}</ul></div></div>` : ""}
       </div>
 
+      ${renderSpeech(ev.speech)}
       <details class="help"><summary>Как читать оценку</summary><ul>
         <li><b>Баллы критерия</b> — сколько он принёс в итог из 100 с учётом перераспределения веса.</li>
         <li><b>N/A</b> — критерий неприменим к этому диалогу; его вес распределён между остальными.</li>
@@ -628,6 +631,26 @@
         ${order.map((g) => `
           ${g.id ? `<div class="section-title">${esc(sectionTitles[g.id] || g.id)}${final.sections && final.sections[g.id] != null ? ` · ${fmt(final.sections[g.id], 0)}%` : ""}</div>` : ""}
           ${g.items.map((c) => renderCriterion(c, ev.results[c.id], final, appealsBy[c.id])).join("")}`).join("")}
+      </div>`;
+  }
+
+  function renderSpeech(sp) {
+    if (!sp) return "";
+    if (!sp.available) {
+      return `<div class="banner info" style="margin:0 0 16px">${icon("info")}<div><b>Запись звонка не анализировалась.</b> ${esc(sp.reason || "")}</div></div>`;
+    }
+    const row = (label, text) => (text ? `<div class="speech-row"><span>${label}</span><div>${esc(text)}</div></div>` : "");
+    return `
+      <div class="panel">
+        <div class="panel-head"><h2>Речь оператора по записи звонка</h2><span class="small muted">модель прослушала аудио; в баллы напрямую не входит</span></div>
+        ${sp.summary ? `<p style="margin:0 0 10px">${esc(sp.summary)}</p>` : ""}
+        <div class="speech">
+          ${row("Интонация", sp.tone)}${row("Дикция и грамотность", sp.diction)}${row("Темп и паузы", sp.pace)}${row("Вежливость", sp.politeness)}
+        </div>
+        ${sp.issues && sp.issues.length ? `<div class="section-title">Замечания</div><ul class="speech-issues">${sp.issues.map((i) => `<li>${esc(i)}</li>`).join("")}</ul>` : ""}
+        ${sp.asr_corrections && sp.asr_corrections.length ? `<div class="section-title">Ошибки распознавания (${sp.asr_corrections.length})</div>
+          <p class="small muted" style="margin:0 0 6px">Расшифровка в этих местах расходится с записью. Ошибки распознавания не считаются ошибкой оператора.</p>
+          <ul class="evidence">${sp.asr_corrections.map((c) => `<li><button class="quote" data-msg="${esc(c.message_id)}" data-quote="${esc(c.heard)}"><span class="mono">${esc(c.message_id)}</span>«${esc(c.heard)}» → «${esc(c.likely)}»</button></li>`).join("")}</ul>` : ""}
       </div>`;
   }
 

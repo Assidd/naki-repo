@@ -3,6 +3,7 @@
 Каждый провайдер получает system/user промпт и JSON-схему ответа, возвращает разобранный JSON
 и расход токенов. Ключи читаются только на сервере из .env.
 """
+import base64
 import json
 import os
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ class LLMReply:
     model: str
     tokens_in: int
     tokens_out: int
+    audio_tokens: int = 0  # часть tokens_in, пришедшая на звук
 
 
 def _price(name: str) -> float:
@@ -40,12 +42,18 @@ KNOWN_PRICES = {
     "gpt-4.1-mini": (0.40, 1.60),
     "gpt-4.1": (2.00, 8.00),
     "o4-mini": (1.10, 4.40),
+    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-2.5-pro": (1.25, 10.00),
+    "gemini-2.0-flash": (0.10, 0.40),
 }
+# Входной звук у Gemini дороже текста (USD за 1 млн аудио-токенов, ~32 токена на секунду записи)
+AUDIO_PRICES = {"gemini-2.5-flash-lite": 0.30, "gemini-2.5-flash": 1.00, "gemini-2.5-pro": 1.25, "gemini-2.0-flash": 0.70}
 
 DEFAULT_OPENAI_MODELS = "gpt-4o-mini,gpt-4.1-mini,gpt-4.1,gpt-4o"
 
 
-def cost_usd(provider: str, model: str, tokens_in: int, tokens_out: int) -> float | None:
+def cost_usd(provider: str, model: str, tokens_in: int, tokens_out: int, audio_tokens: int = 0) -> float | None:
     prefix = provider.upper()
     p_in, p_out = _price(f"{prefix}_PRICE_INPUT_PER_1M"), _price(f"{prefix}_PRICE_OUTPUT_PER_1M")
     default_model = os.getenv(f"{prefix}_MODEL", "").strip()
@@ -58,7 +66,10 @@ def cost_usd(provider: str, model: str, tokens_in: int, tokens_out: int) -> floa
             return None
     if not p_in and not p_out:
         return None
-    return round(tokens_in / 1e6 * p_in + tokens_out / 1e6 * p_out, 6)
+    audio_match = max((k for k in AUDIO_PRICES if model.startswith(k)), key=len, default=None)
+    p_audio = AUDIO_PRICES[audio_match] if audio_match else p_in
+    text_in = max(0, tokens_in - audio_tokens)
+    return round(text_in / 1e6 * p_in + audio_tokens / 1e6 * p_audio + tokens_out / 1e6 * p_out, 6)
 
 
 _clients: dict = {}
@@ -80,6 +91,7 @@ def warm_up() -> None:
 
 class OpenAIProvider:
     name = "openai"
+    supports_audio = False
 
     def __init__(self, model: str | None = None):
         self.key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -89,7 +101,7 @@ class OpenAIProvider:
     def available(self) -> bool:
         return bool(self.key)
 
-    async def complete(self, system: str, user: str, schema: dict) -> LLMReply:
+    async def complete(self, system: str, user: str, schema: dict, audio: tuple[bytes, str] | None = None) -> LLMReply:
         client = _openai_client(self.key)
         kwargs = dict(
             model=self.model,
@@ -121,6 +133,7 @@ class OpenAIProvider:
 
 class GeminiProvider:
     name = "gemini"
+    supports_audio = True  # Gemini принимает запись звонка напрямую
 
     def __init__(self, model: str | None = None):
         self.key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -130,15 +143,20 @@ class GeminiProvider:
     def available(self) -> bool:
         return bool(self.key)
 
-    async def complete(self, system: str, user: str, schema: dict) -> LLMReply:
+    async def complete(self, system: str, user: str, schema: dict, audio: tuple[bytes, str] | None = None) -> LLMReply:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        parts = []
+        if audio:
+            data, mime = audio
+            parts.append({"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode("ascii")}})
+        parts.append({"text": user + "\n\nОтветь строго JSON по схеме:\n" + json.dumps(schema, ensure_ascii=False)})
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": user + "\n\nОтветь строго JSON по схеме:\n" + json.dumps(schema, ensure_ascii=False)}]}],
+            "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
         }
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=240 if audio else 120) as client:
                 resp = await client.post(url, json=body, headers={"x-goog-api-key": self.key})
                 resp.raise_for_status()
                 payload = resp.json()
@@ -152,7 +170,9 @@ class GeminiProvider:
         except (KeyError, IndexError, ValueError):
             raise LLMError("Gemini вернул ответ без JSON") from None
         usage = payload.get("usageMetadata", {})
-        return LLMReply(data, self.model, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0))
+        audio_tokens = sum(d.get("tokenCount", 0) for d in usage.get("promptTokensDetails", []) if d.get("modality") == "AUDIO")
+        out = usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0)
+        return LLMReply(data, self.model, usage.get("promptTokenCount", 0), out, audio_tokens)
 
 
 PROVIDERS = {"openai": OpenAIProvider, "gemini": GeminiProvider}
@@ -201,10 +221,21 @@ def provider_chain(model: str | None = None) -> list:
     return chain
 
 
+def audio_provider(model: str | None = None):
+    """Провайдер для анализа звука: выбранная модель Gemini или GEMINI_MODEL.
+    None — нет ключа Gemini или анализ звука выключен (AUDIO_ANALYSIS=off)."""
+    if os.getenv("AUDIO_ANALYSIS", "on").strip().lower() in ("off", "0", "false", "no"):
+        return None
+    name = model.partition(":")[2] if model and model.startswith("gemini:") else None
+    p = GeminiProvider(name)
+    return p if p.available else None
+
+
 def status() -> dict:
     chain = provider_chain()
     return {
         "configured": bool(chain),
         "providers": [{"name": p.name, "model": p.model} for p in chain],
         "models": available_models(),
+        "audio": {"enabled": bool(audio_provider()), "model": audio_provider().model if audio_provider() else None},
     }

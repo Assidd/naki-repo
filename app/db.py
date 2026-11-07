@@ -91,6 +91,9 @@ def init_db(default_checklist: dict) -> None:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(evaluations)")}
         if "requested_model" not in cols:
             conn.execute("ALTER TABLE evaluations ADD COLUMN requested_model TEXT")
+        # Миграция: анализ речи по записи звонка (интонация, дикция, ошибки распознавания)
+        if "speech" not in cols:
+            conn.execute("ALTER TABLE evaluations ADD COLUMN speech TEXT")
         # Задачи, прерванные перезапуском сервера, не должны висеть вечно.
         conn.execute(
             "UPDATE evaluations SET status='failed', error='Сервер был перезапущен во время оценки', finished_at=? "

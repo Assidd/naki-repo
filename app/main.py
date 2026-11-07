@@ -23,6 +23,7 @@ from .dataset import DatasetError, extract_records, fetch_from_organizer, save_r
 from .db import connect, dumps, init_db, loads, now  # noqa: E402
 from .default_checklist import DEFAULT_CHECKLIST  # noqa: E402
 from .importers import CSV_TEMPLATE, parse_file  # noqa: E402
+from . import media  # noqa: E402
 from . import results as results_mod  # noqa: E402
 from .evaluator import evaluate, semaphore  # noqa: E402
 from .scoring import ChecklistError, allowed_answers, compute, validate_checklist  # noqa: E402
@@ -86,7 +87,7 @@ def _evaluation(conn, eid: int, with_final: bool = True) -> dict:
     if not row:
         raise HTTPException(404, "Оценка не найдена")
     ev = dict(row)
-    for key, default in (("results", None), ("sections", {}), ("issues", [])):
+    for key, default in (("results", None), ("sections", {}), ("issues", []), ("speech", None)):
         ev[key] = loads(ev[key], default)
     ev["critical"] = None if ev["critical"] is None else bool(ev["critical"])
     ev["appeals"] = [dict(a) for a in conn.execute("SELECT * FROM appeals WHERE evaluation_id=? ORDER BY id", (eid,))]
@@ -103,8 +104,15 @@ async def _run(eid: int):
             conv = _conversation(conn, row["conversation_id"])
             checklist = _checklist(conn, row["checklist_id"])["data"]
             conn.execute("UPDATE evaluations SET status='running' WHERE id=?", (eid,))
+        # Звонок с записью: скачиваем звук, если есть модель, которая умеет его слушать (Gemini)
+        audio, audio_note = None, None
+        if conv["channel"] == "voice call" and conv.get("audio_url") and llm.audio_provider(row["requested_model"]):
+            try:
+                audio = await media.download_audio(conv["id"], conv["audio_url"])
+            except media.MediaError as exc:
+                audio_note = f"Запись не проанализирована: {exc}. Звонок оценён по транскрипту."
         try:
-            out = await evaluate(conv, checklist, row["requested_model"])
+            out = await evaluate(conv, checklist, row["requested_model"], audio=audio, audio_note=audio_note)
         except Exception as exc:  # ошибка API не превращается в нулевую оценку
             with connect() as conn:
                 conn.execute("UPDATE evaluations SET status='failed', error=?, finished_at=? WHERE id=?", (str(exc)[:1000], now(), eid))
@@ -112,9 +120,10 @@ async def _run(eid: int):
         with connect() as conn:
             conn.execute(
                 "UPDATE evaluations SET status=?, results=?, score=?, sections=?, critical=?, issues=?, model=?, "
-                "tokens_in=?, tokens_out=?, cost_usd=?, finished_at=? WHERE id=?",
+                "tokens_in=?, tokens_out=?, cost_usd=?, speech=?, finished_at=? WHERE id=?",
                 (out["status"], dumps(out["results"]), out["score"], dumps(out["sections"]), int(out["critical"]),
-                 dumps(out["issues"]), out["model"], out["tokens_in"], out["tokens_out"], out["cost_usd"], now(), eid),
+                 dumps(out["issues"]), out["model"], out["tokens_in"], out["tokens_out"], out["cost_usd"],
+                 dumps(out["speech"]) if out.get("speech") else None, now(), eid),
             )
 
 
@@ -209,7 +218,7 @@ def dataset_delete(group_id: str):
         evals = conn.execute(f"DELETE FROM evaluations WHERE conversation_id IN ({marks})", ids).rowcount
         conn.execute(f"DELETE FROM conversations WHERE id IN ({marks})", ids)
     for cid in ids:
-        _audio_cache.pop(cid, None)
+        media.forget(cid)
     return {"group_id": group_id, "conversations": len(ids), "evaluations": evals}
 
 
@@ -263,40 +272,15 @@ def conversation(cid: str):
     return conv
 
 
-_audio_cache: dict[str, tuple[float, str]] = {}
-
-
 @app.get("/api/conversations/{cid}/audio")
 async def conversation_audio(cid: str):
-    """Звонки: audio_url ведёт на HTML-плеер организаторов, где лежит временная ссылка на mp3.
-    Сервер достаёт её и перенаправляет браузер, чтобы запись играла прямо в карточке."""
+    """Звонки: перенаправляет браузер на временную ссылку mp3 со страницы плеера организаторов."""
     with connect() as conn:
         page_url = _conversation(conn, cid)["audio_url"]
-    if not page_url:
-        raise HTTPException(404, "У диалога нет записи")
-    cached = _audio_cache.get(cid)
-    if cached and cached[0] > time.time():
-        return RedirectResponse(cached[1])
-    page_host = urlsplit(page_url).hostname or ""
-    allowed = urlsplit(os.getenv("ORGANIZER_API_URL", "")).hostname
-    if page_url.lower().split("?")[0].endswith((".mp3", ".wav", ".m4a", ".ogg")):
-        return RedirectResponse(page_url)
-    if not allowed or page_host != allowed:
-        raise HTTPException(400, "Запись не с сервера организаторов — откройте ссылку вручную")
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(page_url)
-            resp.raise_for_status()
-    except httpx.HTTPError:
-        raise HTTPException(502, "Не удалось открыть плеер организаторов") from None
-    match = re.search(r'<source[^>]+src="([^"]+)"', resp.text) or re.search(r'<audio[^>]+src="([^"]+)"', resp.text)
-    if not match:
-        raise HTTPException(502, "На странице плеера не найдена ссылка на запись")
-    src = html.unescape(match.group(1))
-    if urlsplit(src).scheme != "https":
-        raise HTTPException(502, "Ссылка на запись не HTTPS")
-    _audio_cache[cid] = (time.time() + 40 * 60, src)  # ссылка организаторов живёт около часа
-    return RedirectResponse(src)
+        return RedirectResponse(await media.resolve_audio(cid, page_url))
+    except media.MediaError as exc:
+        raise HTTPException(exc.status, str(exc)) from None
 
 
 # ---------- чек-лист ----------

@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from . import llm
 from .scoring import allowed_answers, compute
 
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
 
 RESPONSE_SCHEMA = {
     "type": "object",
@@ -190,25 +190,101 @@ def check_reply(data: dict, conv: dict, checklist: dict) -> tuple[dict, list[str
     return results, structural, evidence_issues
 
 
-async def evaluate(conv: dict, checklist: dict, model: str | None = None) -> dict:
-    """Возвращает словарь для сохранения в evaluations. Бросает llm.LLMError, если ни один провайдер не ответил."""
-    chain = llm.provider_chain(model)
-    if not chain:
+SPEECH_PROPERTIES = {
+    "tone": {"type": "string"},
+    "diction": {"type": "string"},
+    "pace": {"type": "string"},
+    "politeness": {"type": "string"},
+    "summary": {"type": "string"},
+    "issues": {"type": "array", "items": {"type": "string"}},
+    "asr_corrections": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["message_id", "heard", "likely"],
+            "properties": {"message_id": {"type": "string"}, "heard": {"type": "string"}, "likely": {"type": "string"}},
+        },
+    },
+}
+AUDIO_SCHEMA = {
+    **RESPONSE_SCHEMA,
+    "required": ["criteria", "speech"],
+    "properties": {
+        **RESPONSE_SCHEMA["properties"],
+        "speech": {"type": "object", "additionalProperties": False, "required": list(SPEECH_PROPERTIES), "properties": SPEECH_PROPERTIES},
+    },
+}
+
+AUDIO_PROMPT = """
+
+К запросу приложена АУДИОЗАПИСЬ этого звонка. Слушай её вместе с транскриптом:
+- Оценивай критерии по тому, что реально прозвучало: тон и вежливость голоса, паузы и ожидание, перебивания, ясность речи оператора.
+- Транскрипт получен автоматическим распознаванием и может содержать ошибки. Если запись расходится с транскриптом, суди по записи, но цитату в evidence всё равно копируй дословно из транскрипта (той реплики, где это прозвучало), а расхождение укажи в speech.asr_corrections.
+- Ошибки распознавания, шумы и обрывы записи — не ошибка оператора.
+- Если часть разговора не записана (например, запись приостановлена), не выдумывай, что там было.
+
+Заполни блок speech (коротко, по-русски, только про ОПЕРАТОРА):
+- tone — интонация и эмоциональный тон (доброжелательный, нейтральный, раздражённый и т.п.) с примером момента;
+- diction — чёткость и грамотность речи, слова-паразиты;
+- pace — темп речи и паузы, предупреждал ли об ожидании;
+- politeness — вежливость по голосу, перебивал ли клиента;
+- summary — общий вывод в 1–2 предложения;
+- issues — конкретные замечания к речи (может быть пустым);
+- asr_corrections — места, где распознавание явно ошиблось: message_id, что в транскрипте (heard) и что вероятно сказано (likely). Только существенные расхождения, максимум 10."""
+
+
+def check_speech(data: dict, conv: dict) -> dict:
+    ids = {m["id"] for m in conv["transcript"]}
+    raw = data.get("speech") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        return {"available": False, "reason": "Модель не вернула анализ речи"}
+    text = lambda k: str(raw.get(k) or "").strip()
+    corrections = []
+    for c in raw.get("asr_corrections") or []:
+        if isinstance(c, dict) and str(c.get("message_id")) in ids and str(c.get("likely") or "").strip():
+            corrections.append({"message_id": str(c["message_id"]), "heard": str(c.get("heard") or "").strip(), "likely": str(c["likely"]).strip()})
+    return {
+        "available": True,
+        "tone": text("tone"), "diction": text("diction"), "pace": text("pace"), "politeness": text("politeness"),
+        "summary": text("summary"),
+        "issues": [str(x).strip() for x in (raw.get("issues") or []) if str(x).strip()][:10],
+        "asr_corrections": corrections[:10],
+    }
+
+
+async def evaluate(conv: dict, checklist: dict, model: str | None = None,
+                   audio: tuple[bytes, str] | None = None, audio_note: str | None = None) -> dict:
+    """Возвращает словарь для сохранения в evaluations. Бросает llm.LLMError, если ни один провайдер не ответил.
+
+    Для звонка с записью первой пробуется модель со звуком (Gemini): она слушает запись вместе с транскриптом.
+    Если она недоступна или не ответила, звонок оценивается по тексту обычной цепочкой провайдеров.
+    """
+    is_call = conv.get("channel") == "voice call"
+    attempts = []
+    audio_p = llm.audio_provider(model) if (is_call and audio) else None
+    if audio_p:
+        attempts.append((audio_p, audio))
+    attempts += [(p, None) for p in llm.provider_chain(model)]
+    if not attempts:
         raise llm.LLMError("Не настроен ни один провайдер модели. Укажите OPENAI_API_KEY в .env и перезапустите сервер.")
     user_prompt = build_user_prompt(conv, checklist)
     errors = []
-    for provider in chain:
-        tokens_in = tokens_out = 0
+    for provider, sound in attempts:
+        tokens_in = tokens_out = audio_tokens = 0
+        system = SYSTEM_PROMPT + (AUDIO_PROMPT if sound else "")
+        schema = AUDIO_SCHEMA if sound else RESPONSE_SCHEMA
         prompt = user_prompt
         try:
             best = None
             for attempt in range(2):  # первая попытка + одна попытка исправления
-                reply = await provider.complete(SYSTEM_PROMPT, prompt, RESPONSE_SCHEMA)
+                reply = await provider.complete(system, prompt, schema, audio=sound)
                 tokens_in += reply.tokens_in
                 tokens_out += reply.tokens_out
+                audio_tokens += reply.audio_tokens
                 results, structural, ev_issues = check_reply(reply.data, conv, checklist)
                 if not structural:
-                    best = (results, ev_issues, reply.model)
+                    best = (results, ev_issues, reply.model, reply.data)
                     if not ev_issues:
                         break
                 feedback = structural + ev_issues
@@ -218,15 +294,23 @@ async def evaluate(conv: dict, checklist: dict, model: str | None = None) -> dic
                     + "\n- ".join(feedback[:20])
                 )
             if best is None:
-                errors.append(f"{provider.name}: ответ не прошёл проверку структуры")
+                errors.append(f"{provider.name}{' (звук)' if sound else ''}: ответ не прошёл проверку структуры")
                 continue
         except llm.LLMError as exc:
-            errors.append(str(exc))
+            errors.append(str(exc) + (" (анализ звука)" if sound else ""))
             continue
-        results, ev_issues, model = best
+        results, ev_issues, used_model, data = best
         calc = compute(checklist, {cid: r["answer"] for cid, r in results.items()})
         for cid, r in results.items():
             r.update(calc["criteria"][cid])
+        speech = None
+        if is_call:
+            if sound:
+                speech = check_speech(data, conv)
+            else:
+                reason = audio_note or ("Анализ звука выполнен не был: " + "; ".join(errors) if errors and audio_p
+                                        else "Запись не анализировалась: для анализа звука нужен GEMINI_API_KEY в .env")
+                speech = {"available": False, "reason": reason}
         return {
             "status": "needs_review" if ev_issues else "done",
             "results": results,
@@ -234,10 +318,11 @@ async def evaluate(conv: dict, checklist: dict, model: str | None = None) -> dic
             "sections": calc["sections"],
             "critical": calc["critical"],
             "issues": ev_issues,
-            "model": f"{provider.name}:{model} (prompt {PROMPT_VERSION})",
+            "model": f"{provider.name}:{used_model}{' +audio' if sound else ''} (prompt {PROMPT_VERSION})",
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
-            "cost_usd": llm.cost_usd(provider.name, provider.model, tokens_in, tokens_out),
+            "cost_usd": llm.cost_usd(provider.name, provider.model, tokens_in, tokens_out, audio_tokens),
+            "speech": speech,
         }
     raise llm.LLMError("; ".join(errors) or "Модель не ответила")
 

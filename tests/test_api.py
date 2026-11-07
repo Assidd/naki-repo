@@ -20,7 +20,9 @@ class FakeProvider:
         self.replies = list(replies)
         self.calls = 0
 
-    async def complete(self, system, user, schema):
+    async def complete(self, system, user, schema, audio=None):
+        self.last_audio = audio
+        self.last_system = system
         self.calls += 1
         return llm.LLMReply(self.replies.pop(0), "fake-model", 100, 50)
 
@@ -124,7 +126,7 @@ def test_provider_error_is_not_zero_score(client, monkeypatch):
     client.post("/api/dataset/import", json={"group_id": "DEMO", "payload": SAMPLES})
 
     class Broken(FakeProvider):
-        async def complete(self, *a):
+        async def complete(self, *a, **k):
             raise llm.LLMError("timeout")
 
     monkeypatch.setattr(llm, "provider_chain", lambda *a, **k: [Broken([])])
@@ -139,7 +141,7 @@ def test_fallback_provider_is_used(client, monkeypatch):
     class Broken(FakeProvider):
         name = "primary"
 
-        async def complete(self, *a):
+        async def complete(self, *a, **k):
             raise llm.LLMError("quota")
 
     backup = FakeProvider([good_reply()])
@@ -247,3 +249,78 @@ def test_delete_dataset(client, monkeypatch):
     assert [c["id"] for c in client.get("/api/conversations").json()] == ["k1"]
     assert client.get("/api/appeals").json() == []
     assert client.delete("/api/datasets/DEMO").status_code == 404
+
+
+def call_reply(with_speech=True):
+    items = [
+        ("c1", "yes", [("m1", "меня зовут Алексей")]), ("c2", "yes", [("m3", "какая ошибка на экране")]),
+        ("c3", "na", []), ("c4", "15", [("m5", "Обновите приложение")]), ("c5", "yes", [("m7", "Чем-то ещё могу помочь")]),
+        ("c6", "10", [("m5", "Обновите приложение")]), ("c7", "yes", [("m7", "Всего доброго")]), ("c8", "no", []),
+    ]
+    data = {"criteria": [{"criterion_id": c, "answer": a, "explanation": "ok", "checked_range": None,
+                          "evidence": [{"message_id": m, "quote": q} for m, q in ev]} for c, a, ev in items]}
+    if with_speech:
+        data["speech"] = {"tone": "доброжелательный", "diction": "чёткая", "pace": "спокойный", "politeness": "не перебивал",
+                          "summary": "Хорошо", "issues": [], "asr_corrections": [
+                              {"message_id": "m5", "heard": "эс эм эс", "likely": "SMS"},
+                              {"message_id": "m99", "heard": "x", "likely": "y"}]}
+    return data
+
+
+def test_call_is_evaluated_with_audio_by_gemini(client, monkeypatch):
+    client.post("/api/dataset/import", json={"group_id": "DEMO", "payload": SAMPLES})
+    from app import main
+    from app.db import connect
+    with connect() as conn:
+        conn.execute("UPDATE conversations SET audio_url='https://example.org/call.mp3' WHERE id='demo-call-001'")
+    audio_fake = FakeProvider([call_reply()])
+    audio_fake.name, audio_fake.model = "gemini", "gemini-test"
+    text_fake = FakeProvider([call_reply(False)])
+    monkeypatch.setattr(llm, "audio_provider", lambda *a, **k: audio_fake)
+    monkeypatch.setattr(llm, "provider_chain", lambda *a, **k: [text_fake])
+
+    async def fake_download(cid, url):
+        return b"ID3fake", "audio/mpeg"
+    monkeypatch.setattr(main.media, "download_audio", fake_download)
+
+    eid = client.post("/api/evaluations", json={"conversation_id": "demo-call-001"}).json()["id"]
+    ev = wait_eval(client, eid)
+    assert ev["status"] == "done", ev
+    assert audio_fake.last_audio == (b"ID3fake", "audio/mpeg") and "АУДИОЗАПИСЬ" in audio_fake.last_system
+    assert text_fake.calls == 0
+    assert "+audio" in ev["model"]
+    sp = ev["speech"]
+    assert sp["available"] and sp["tone"] == "доброжелательный"
+    assert sp["asr_corrections"] == [{"message_id": "m5", "heard": "эс эм эс", "likely": "SMS"}]  # m99 отброшен
+
+
+def test_call_falls_back_to_text_when_audio_fails(client, monkeypatch):
+    client.post("/api/dataset/import", json={"group_id": "DEMO", "payload": SAMPLES})
+    from app import main
+    from app.db import connect
+    with connect() as conn:
+        conn.execute("UPDATE conversations SET audio_url='https://example.org/call.mp3' WHERE id='demo-call-001'")
+
+    class BrokenAudio(FakeProvider):
+        name, model = "gemini", "gemini-test"
+
+        async def complete(self, *a, **k):
+            raise llm.LLMError("Gemini: HTTP 429")
+
+    text_fake = FakeProvider([call_reply(False)])
+    monkeypatch.setattr(llm, "audio_provider", lambda *a, **k: BrokenAudio([]))
+    monkeypatch.setattr(llm, "provider_chain", lambda *a, **k: [text_fake])
+
+    async def fake_download(cid, url):
+        return b"ID3fake", "audio/mpeg"
+    monkeypatch.setattr(main.media, "download_audio", fake_download)
+
+    eid = client.post("/api/evaluations", json={"conversation_id": "demo-call-001"}).json()["id"]
+    ev = wait_eval(client, eid)
+    assert ev["status"] == "done" and text_fake.last_audio is None
+    assert ev["speech"]["available"] is False and "429" in ev["speech"]["reason"]
+
+
+def test_gemini_audio_cost():
+    # 1000 текстовых + 3000 аудио-токенов на входе, 500 на выходе для gemini-2.5-flash
+    assert llm.cost_usd("gemini", "gemini-2.5-flash", 4000, 500, 3000) == round(1000 / 1e6 * 0.30 + 3000 / 1e6 * 1.00 + 500 / 1e6 * 2.50, 6)
